@@ -265,39 +265,48 @@ class CausalSelfAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        n_head = self.config.n_head
+        n_query_groups = self.config.n_query_groups
+        rope_n_elem = self.config.rope_n_elem
+        head_size = self.config.head_size
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         qkv = self.attn(x)
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
-        q_per_kv = self.config.n_head // self.config.n_query_groups
+        q_per_kv = n_head // n_query_groups
         total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
-        qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size)
+        qkv = qkv.view(B, T, n_query_groups, total_qkv, head_size)
         qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
 
-        # split batched computation into three
+        # split batched computation into three:
+        # q: (B, n_query_groups, q_per_kv, T, hs)
+        # k: (B, n_query_groups, 1, T, hs)
+        # v: (B, n_query_groups, 1, T, hs)
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
 
-        # maybe repeat k and v if for the non multi-head attention cases
-        # training: flash attention requires it
-        # inference: multi-query would require a full kv cache so avoid it to limit its memory usage
-        if self.config.n_query_groups != self.config.n_head and (input_pos is None or self.config.n_query_groups != 1):
-            k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
-            v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
-
-        q = q.reshape(B, -1, T, self.config.head_size)  # (B, nh_q, T, hs)
-        k = k.reshape(B, -1, T, self.config.head_size)  # (B, nh_k, T, hs)
-        v = v.reshape(B, -1, T, self.config.head_size)  # (B, nh_v, T, hs)
-
-        q_roped = apply_rope(q[..., : self.config.rope_n_elem], cos, sin)
-        k_roped = apply_rope(k[..., : self.config.rope_n_elem], cos, sin)
-        q = torch.cat((q_roped, q[..., self.config.rope_n_elem :]), dim=-1)
-        k = torch.cat((k_roped, k[..., self.config.rope_n_elem :]), dim=-1)
+        q_roped = apply_rope(q[..., : rope_n_elem], cos, sin)
+        k_roped = apply_rope(k[..., : rope_n_elem], cos, sin)
+        q = torch.cat((q_roped, q[..., rope_n_elem :]), dim=-1)
+        k = torch.cat((k_roped, k[..., rope_n_elem :]), dim=-1)
 
         if input_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
-            k, v = self.kv_cache(input_pos, k, v)
+            k, v = self.kv_cache(input_pos, k.squeeze(2), v.squeeze(2))
+            k = k.unsqueeze(2)
+            v = v.unsqueeze(2)
+
+        # maybe repeat k and v if for the non multi-head attention cases
+        # training: flash attention requires it
+        # inference: multi-query would require a full kv cache so avoid it to limit its memory usage
+        if q_per_kv > 1:
+            k = k.expand(*q.shape)
+            v = v.expand(*q.shape)
+
+        q = q.flatten(start_dim=1, end_dim=2)  # (B, n_head, T, hs)
+        k = k.flatten(start_dim=1, end_dim=2)  # (B, n_head, T, hs)
+        v = v.flatten(start_dim=1, end_dim=2)  # (B, n_head, T, hs)
 
         if self.apply_sliding_window_attention:
             """
@@ -319,7 +328,7 @@ class CausalSelfAttention(nn.Module):
 
         y = self.scaled_dot_product_attention(q, k, v, mask)
 
-        y = y.reshape(B, T, self.config.head_size * self.config.n_head)  # re-assemble all head outputs side by side
+        y = y.flatten(start_dim=-2, end_dim=-1)  # re-assemble all head outputs side by side
 
         # output projection
         return self.proj(y)
@@ -356,19 +365,16 @@ class CausalSelfAttention(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> "KVCache":
-        heads = 1 if self.config.n_query_groups == 1 else self.config.n_head
-        v_shape = (batch_size, heads, max_seq_length, self.config.head_size)
-        if rope_cache_length is None:
-            if self.config.rotary_percentage != 1.0:
+        n_query_groups = self.config.n_query_groups
+        head_size = self.config.head_size
+        rope_n_elem = self.config.rope_n_elem
+        v_shape = (batch_size, n_query_groups, max_seq_length, head_size)
+        if rope_cache_length is None or rope_cache_length == rope_n_elem:
+            if self.config.rotary_percentage != 1.0 and rope_cache_length is None:
                 raise TypeError("Please pass the `rope_cache_length=gpt.cos.size(-1)` value")
             k_shape = v_shape
         else:
-            k_shape = (
-                batch_size,
-                heads,
-                max_seq_length,
-                rope_cache_length + self.config.head_size - self.config.rope_n_elem,
-            )
+            k_shape = v_shape[:3] + (head_size + rope_cache_length - rope_n_elem,)
         return KVCache(k_shape, v_shape, device=device, dtype=dtype)
 
 
@@ -557,15 +563,17 @@ def batched_index_copy_(t, dim, idx, val):
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     head_size = x.size(-1)
-    x1 = x[..., : head_size // 2]  # (B, nh, T, hs/2)
-    x2 = x[..., head_size // 2 :]  # (B, nh, T, hs/2)
-    rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
+    x1 = x[..., : head_size // 2]  # (B, ..., T, hs/2)
+    x2 = x[..., head_size // 2 :]  # (B, ..., T, hs/2)
+    rotated = torch.cat((-x2, x1), dim=-1)  # (B, ..., T, hs)
     if cos.dim() > 1:
         # batch dimensions must align
-        # sin/cos are (B, T, hs) so we unsqeeze -3 for nh
+        # sin/cos are (B, T, hs) so we unsqeeze -3 for the
+        # extra dimensions in `x`.
         # we count from back because all of apply_rope does
-        cos = cos.unsqueeze(-3)
-        sin = sin.unsqueeze(-3)
+        for _ in range(x.dim() - 3):
+            cos = cos.unsqueeze(-3)
+            sin = sin.unsqueeze(-3)
 
     roped = (x * cos) + (rotated * sin)
     return roped.to(dtype=x.dtype)
