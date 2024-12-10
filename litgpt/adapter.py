@@ -19,7 +19,6 @@ from litgpt.config import Config as BaseConfig
 from litgpt.model import GPT as BaseModel
 from litgpt.model import Block as BaseBlock
 from litgpt.model import CausalSelfAttention as BaseCausalSelfAttention
-from litgpt.model import batched_index_select, KVCache
 
 
 @dataclass

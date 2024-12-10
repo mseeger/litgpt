@@ -62,6 +62,8 @@ class AdapterV2Linear(torch.nn.Module):
         nn.init.ones_(self.adapter_scale)
 
 
+# TODO: Since `BaseModel`, `BaseBlock` also receives layer index and passes it
+# down, much of the copy-and-paste here can be avoided.
 class GPT(BaseModel):
     def __init__(self, config: Config) -> None:
         # Skip the parent class __init__ altogether and replace it to avoid useless allocations
@@ -73,44 +75,12 @@ class GPT(BaseModel):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config, i) for i in range(config.n_layer)),
+                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
-
-    def forward(
-        self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, lm_head_chunk_size: int = 0
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        T = idx.size(1)
-        if self.max_seq_length < T:
-            raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
-
-        if input_pos is not None:  # use the kv cache
-            cos = self.cos.index_select(0, input_pos)
-            sin = self.sin.index_select(0, input_pos)
-            if self.mask_cache is None:
-                raise TypeError("You need to call `gpt.set_kv_cache()`")
-            mask = self.mask_cache.index_select(2, input_pos)
-        else:
-            cos = self.cos[:T]
-            sin = self.sin[:T]
-            mask = None
-
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        if self.config.scale_embeddings:
-            x = x * (self.config.n_embd**0.5)
-        for block in self.transformer.h:
-            x = block(x, cos, sin, mask, input_pos)
-        x = self.transformer.ln_f(x)
-        if lm_head_chunk_size > 0:
-            # chunk the lm head logits to reduce the peak memory used by autograd
-            return [self.lm_head(x_i) for x_i in x.split(lm_head_chunk_size, dim=1)]
-        x = self.lm_head(x)  # (b, t, vocab_size)
-        if self.config.final_logit_softcapping is not None:
-            x = torch.tanh(x / self.config.final_logit_softcapping) * self.config.final_logit_softcapping
-        return x
+        self.max_seq_length = self.config.block_size
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:

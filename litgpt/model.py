@@ -303,8 +303,7 @@ class CausalSelfAttention(nn.Module):
 
         # split batched computation into three:
         # q: (B, n_query_groups, q_per_kv, T, head_size)
-        # k: (B, n_query_groups, 1, T, head_size)
-        # v: (B, n_query_groups, 1, T, head_size)
+        # k, v: (B, n_query_groups, 1, T, head_size)
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
 
         q_roped = apply_rope(q[..., : rope_n_elem], cos, sin)
@@ -318,8 +317,7 @@ class CausalSelfAttention(nn.Module):
             k, v = self.kv_cache(input_pos, k.squeeze(2), v.squeeze(2))
             k = k.unsqueeze(2)
             v = v.unsqueeze(2)
-            # Shape of `k`, `v` is
-            # (B, n_query_groups, 1, covering_length, head_size) now
+            # k, v: (B, n_query_groups, 1, covering_length, head_size)
 
         # Expand `k`, `v` so their initial dimensions match `q`
         if q_per_kv > 1:
@@ -327,8 +325,8 @@ class CausalSelfAttention(nn.Module):
             k = k.expand(*new_shape)
             v = v.expand(*new_shape)
 
-        # Reshape `q` to (B, n_head, T, head_size). If `input_pos` is None, `k`
-        # and `v` have the same shape. Otherwise, their new shape is
+        # Reshape q to (B, n_head, T, head_size). If input_pos is None, k
+        # and v have the same shape. Otherwise, their new shape is
         # (B, n_head, covering_length, head_size), coming from the KV cache.
         q = q.flatten(start_dim=1, end_dim=2)
         k = k.flatten(start_dim=1, end_dim=2)
@@ -348,6 +346,7 @@ class CausalSelfAttention(nn.Module):
             if mask is None:
                 mask = torch.ones(T, T, dtype=q.dtype, device=q.device).triu(diagonal=1)
                 mask.masked_fill_(mask.bool(), float("-inf"))
+                mask = mask.view(1, 1, *mask.shape)
             sliding_window_bias = torch.ones_like(mask).tril(diagonal=-self.config.sliding_window_size)
             sliding_window_bias.masked_fill_(sliding_window_bias.bool(), float("-inf"))
             mask += sliding_window_bias
