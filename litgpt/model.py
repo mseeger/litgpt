@@ -30,8 +30,9 @@ class GPT(nn.Module):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
+        print(f"mask_cache = {self.mask_cache}")
+        self.max_seq_length = self.config.block_size
 
     @property
     def max_seq_length(self) -> int:
@@ -43,6 +44,7 @@ class GPT(nn.Module):
         When doing inference, the sequences used might be shorter than the model's context length.
         This allows setting a smaller number to avoid allocating unused memory
         """
+        print("Called max_seq_length setter")
         if value > self.config.block_size:
             raise ValueError(f"Cannot attend to {value}, block size is only {self.config.block_size}."
                              " This is likely because the input text exceeds the supported context length of this model.")
@@ -57,6 +59,9 @@ class GPT(nn.Module):
             self.cos, self.sin = self.rope_cache(device=self.cos.device)
         # the mask and kv cache size will get updated on `set_kv_cache`. we cannot update it here because we don't know
         # if the kv cache is expected
+        print("Here we are")
+        if self.mask_cache is not None and self.mask_cache.shape[-1] < value:
+            print(f"Warning: KV cache has length {self.mask_cache.shape[-1]} < {value} = max_seq_length. Call 'set_kv_cache' before doing any forwards!")
 
     def reset_parameters(self) -> None:
         # Trigger resetting the rope-cache
@@ -71,7 +76,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        idx: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        lm_head_chunk_size: int = 0,
+    ) -> torch.Tensor:
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -85,15 +95,20 @@ class GPT(nn.Module):
             if mask.dim() > 4:
                 # the mask cache has a batch dim of 1 in addition to the one
                 # we get if input_pos has a batch dimension
-                mask = mask.squeeze(1)
+                mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
+            # Shorten final dimension so it just covers all `input_pos` entries
+            covering_length = KVCache.covering_length(input_pos)
+            if covering_length > self.max_seq_length:
+                raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
+            mask = mask[..., :covering_length]
         else:
-            cos = self.cos[:T]
-            sin = self.sin[:T]
+            cos = self.cos[:T].unsqueeze(0)
+            sin = self.sin[:T].unsqueeze(0)
             mask = None
 
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         if self.config.scale_embeddings:
-            x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
+            x = x * (self.config.n_embd**0.5)
 
         for block in self.transformer.h:
             x = block(x, cos, sin, mask, input_pos)
@@ -277,12 +292,12 @@ class CausalSelfAttention(nn.Module):
         q_per_kv = n_head // n_query_groups
         total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
         qkv = qkv.view(B, T, n_query_groups, total_qkv, head_size)
-        qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
+        qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, head_size)
 
         # split batched computation into three:
-        # q: (B, n_query_groups, q_per_kv, T, hs)
-        # k: (B, n_query_groups, 1, T, hs)
-        # v: (B, n_query_groups, 1, T, hs)
+        # q: (B, n_query_groups, q_per_kv, T, head_size)
+        # k: (B, n_query_groups, 1, T, head_size)
+        # v: (B, n_query_groups, 1, T, head_size)
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
 
         q_roped = apply_rope(q[..., : rope_n_elem], cos, sin)
@@ -296,17 +311,21 @@ class CausalSelfAttention(nn.Module):
             k, v = self.kv_cache(input_pos, k.squeeze(2), v.squeeze(2))
             k = k.unsqueeze(2)
             v = v.unsqueeze(2)
+            # Shape of `k`, `v` is
+            # (B, n_query_groups, 1, covering_length, head_size) now
 
-        # maybe repeat k and v if for the non multi-head attention cases
-        # training: flash attention requires it
-        # inference: multi-query would require a full kv cache so avoid it to limit its memory usage
+        # Expand `k`, `v` so their initial dimensions match `q`
         if q_per_kv > 1:
-            k = k.expand(*q.shape)
-            v = v.expand(*q.shape)
+            new_shape = k.shape[0:2] + (q_per_kv,) + k.shape[3:]
+            k = k.expand(*new_shape)
+            v = v.expand(*new_shape)
 
-        q = q.flatten(start_dim=1, end_dim=2)  # (B, n_head, T, hs)
-        k = k.flatten(start_dim=1, end_dim=2)  # (B, n_head, T, hs)
-        v = v.flatten(start_dim=1, end_dim=2)  # (B, n_head, T, hs)
+        # Reshape `q` to (B, n_head, T, head_size). If `input_pos` is None, `k`
+        # and `v` have the same shape. Otherwise, their new shape is
+        # (B, n_head, covering_length, head_size), coming from the KV cache.
+        q = q.flatten(start_dim=1, end_dim=2)
+        k = k.flatten(start_dim=1, end_dim=2)
+        v = v.flatten(start_dim=1, end_dim=2)
 
         if self.apply_sliding_window_attention:
             """
@@ -562,18 +581,18 @@ def batched_index_copy_(t, dim, idx, val):
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    head_size = x.size(-1)
-    x1 = x[..., : head_size // 2]  # (B, ..., T, hs/2)
-    x2 = x[..., head_size // 2 :]  # (B, ..., T, hs/2)
-    rotated = torch.cat((-x2, x1), dim=-1)  # (B, ..., T, hs)
-    if cos.dim() > 1:
-        # batch dimensions must align
-        # sin/cos are (B, T, hs) so we unsqeeze -3 for the
-        # extra dimensions in `x`.
-        # we count from back because all of apply_rope does
-        for _ in range(x.dim() - 3):
-            cos = cos.unsqueeze(-3)
-            sin = sin.unsqueeze(-3)
+    # x: (B, ..., T, head_size)
+    # cos, sin: (B, T, head_size) or (1, T, head_size)
+    head_size_half = x.size(-1)
+    x1 = x[..., : head_size_half]  # (B, ..., T, head_size/2)
+    x2 = x[..., head_size_half :]  # (B, ..., T, head_size/2)
+    rotated = torch.cat((-x2, x1), dim=-1)  # (B, ..., T, head_size)
+    dims_diff = x.dim() - cos.dim()
+    if dims_diff > 0:
+        # Ensure that shapes of `x`, `cos`, `sin` align
+        new_shape = cos.shape[0:1] + (1,) * dims_diff + cos.shape[1:]
+        cos = cos.view(*new_shape)
+        sin = sin.view(*new_shape)
 
     roped = (x * cos) + (rotated * sin)
     return roped.to(dtype=x.dtype)
@@ -596,14 +615,20 @@ class KVCache(nn.Module):
         self.k = self.k.to(k.dtype)
         self.v = self.v.to(v.dtype)
         # update the cache
-        n = k.size(0)
-        k = batched_index_copy_(self.k[:n, ...], -2, input_pos, k)
-        v = batched_index_copy_(self.v[:n, ...], -2, input_pos, v)
-        return k, v
+        bs = k.size(0)
+        k = batched_index_copy_(self.k[:bs, ...], -2, input_pos, k)
+        v = batched_index_copy_(self.v[:bs, ...], -2, input_pos, v)
+        # Final dimension only needs to cover all positions in `input_pos`
+        final_length = self.covering_length(input_pos)
+        return k[..., :final_length], v[..., :final_length]
 
     def reset_parameters(self) -> None:
         torch.nn.init.zeros_(self.k)
         torch.nn.init.zeros_(self.v)
+
+    @staticmethod
+    def covering_length(input_pos: torch.Tensor) -> int:
+        return int(input_pos.flatten().max().item()) + 1
 
 
 def build_mask_cache(max_seq_length: int, device: Optional[torch.device] = None) -> torch.Tensor:
