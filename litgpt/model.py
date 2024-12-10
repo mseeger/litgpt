@@ -23,16 +23,33 @@ class GPT(nn.Module):
         assert config.padded_vocab_size is not None
         self.config = config
 
-        self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
+        self.lm_head = self.create_lm_head(config)
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                wte=self.create_initial_embedding(config),
+                h=nn.ModuleList(
+                    self.create_block(config, block_idx)
+                    for block_idx in range(config.n_layer)
+                ),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
         self.mask_cache: Optional[torch.Tensor] = None
         self.max_seq_length = self.config.block_size
+
+    @staticmethod
+    def create_initial_embedding(config: Config) -> nn.Embedding:
+        return nn.Embedding(config.padded_vocab_size, config.n_embd)
+
+    @staticmethod
+    def create_block(config: Config, block_idx: int) -> "Block":
+        return Block(config, block_idx)
+
+    @staticmethod
+    def create_lm_head(config: Config) -> nn.Module:
+        return nn.Linear(
+            config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias
+        )
 
     @property
     def max_seq_length(self) -> int:
@@ -207,7 +224,7 @@ class Block(nn.Module):
             )
 
         self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.attn = CausalSelfAttention(config, block_idx)
+        self.attn = self.create_self_attention(config, block_idx)
         self.post_attention_norm = (
             config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_attention_norm else nn.Identity()
         )
@@ -218,6 +235,10 @@ class Block(nn.Module):
         )
 
         self.config = config
+
+    @staticmethod
+    def create_self_attention(config: Config, block_idx: int) -> "CausalSelfAttention":
+        return CausalSelfAttention(config, block_idx)
 
     def forward(
         self,
@@ -264,20 +285,33 @@ class Block(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: Config, block_idx: int) -> None:
         super().__init__()
-        shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
-        self.attn = nn.Linear(config.n_embd, shape, bias=config.bias or config.attn_bias)
+        self.attn = self.create_qkv_linear(config)
         # output projection
-        # if `head_size` is explicitly specified in the config, `n_emd` might not be equal to `head_size * n_head`
-        self.proj = nn.Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
+        self.proj = self.create_output_projection(config)
         # disabled by default
         self.kv_cache: Optional[KVCache] = None
         self.apply_sliding_window_attention = (
             config.sliding_window_size is not None and
             block_idx % config.sliding_window_layer_placing == 0
         )
-
         self.config = config
+        self.block_idx = block_idx
+
+    @staticmethod
+    def create_qkv_linear(config: Config) -> nn.Module:
+        shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
+        return nn.Linear(
+            config.n_embd, shape, bias=config.bias or config.attn_bias
+        )
+
+    @staticmethod
+    def create_output_projection(config: Config) -> nn.Module:
+        # if `head_size` is explicitly specified in the config, `n_emd` might
+        # not be equal to `head_size * n_head`
+        return nn.Linear(
+            config.head_size * config.n_head, config.n_embd, bias=config.bias
+        )
 
     def forward(
         self,
@@ -401,12 +435,25 @@ class CausalSelfAttention(nn.Module):
         return KVCache(k_shape, v_shape, device=device, dtype=dtype)
 
 
-class GptNeoxMLP(nn.Module):
+class TransformerBlockMLP(nn.Module):
+    @staticmethod
+    def create_fc(config: Config) -> nn.Module:
+        return nn.Linear(
+            config.n_embd, config.intermediate_size, bias=config.bias
+        )
+
+    @staticmethod
+    def create_proj(config: Config) -> nn.Module:
+        return nn.Linear(
+            config.intermediate_size, config.n_embd, bias=config.bias
+        )
+
+
+class GptNeoxMLP(TransformerBlockMLP):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-
+        self.fc = self.create_fc(config)
+        self.proj = self.create_proj(config)
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -415,13 +462,12 @@ class GptNeoxMLP(nn.Module):
         return self.proj(x)
 
 
-class LLaMAMLP(nn.Module):
+class LLaMAMLP(TransformerBlockMLP):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-
+        self.fc_1 = self.create_fc(config)
+        self.fc_2 = self.create_fc(config)
+        self.proj = self.create_proj(config)
         self.config = config
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -442,10 +488,17 @@ class GemmaMLP(LLaMAMLP):
 class LLaMAMoE(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.gate = nn.Linear(config.n_embd, config.n_expert, bias=False)
-        self.experts = nn.ModuleList(LLaMAMLP(config) for _ in range(config.n_expert))
-
+        self.gate = self.create_gate(config)
+        self.experts = self.create_experts(config)
         self.config = config
+
+    @staticmethod
+    def create_gate(config: Config) -> nn.Module:
+        return nn.Linear(config.n_embd, config.n_expert, bias=False)
+
+    @staticmethod
+    def create_experts(config: Config) -> nn.ModuleList:
+        return nn.ModuleList(LLaMAMLP(config) for _ in range(config.n_expert))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

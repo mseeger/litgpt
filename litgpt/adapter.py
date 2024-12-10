@@ -9,7 +9,7 @@ Port for LitGPT
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,27 +27,10 @@ class Config(BaseConfig):
     adapter_start_layer: int = 2
 
 
-# TODO: Since `BaseModel`, `BaseBlock` also receives layer index and passes it
-# down, much of the copy-and-paste here can be avoided.
 class GPT(BaseModel):
-    """The implementation is identical to `litgpt.model.GPT` with the exception that
-    the `Block` saves the layer index and passes it down to the attention layer."""
-
-    def __init__(self, config: Config) -> None:
-        nn.Module.__init__(self)
-        assert config.padded_vocab_size is not None
-        self.config = config
-
-        self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
-                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
-            )
-        )
-        self.mask_cache: Optional[torch.Tensor] = None
-        self.max_seq_length = self.config.block_size
+    @staticmethod
+    def create_block(config: BaseConfig, block_idx: int) -> BaseBlock:
+        return Block(config, block_idx)
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -61,30 +44,9 @@ class GPT(BaseModel):
 
 
 class Block(BaseBlock):
-    """The implementation is identical to `litgpt.model.Block` with the exception that
-    we replace the attention layer where adaption is implemented."""
-
-    def __init__(self, config: Config, block_idx: int) -> None:
-        # Skip the parent class __init__ altogether and replace it to avoid useless allocations
-        nn.Module.__init__(self)
-        if not config.parallel_residual and config.shared_attention_norm:
-            raise NotImplementedError(
-                "No checkpoint amongst the ones we support uses this configuration:"
-
-                " non-parallel residual and shared attention norm."
-            )
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.attn = CausalSelfAttention(config, block_idx)
-        self.post_attention_norm = (
-            config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_attention_norm else nn.Identity()
-        )
-        self.norm_2 = None if config.shared_attention_norm else config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.mlp = config.mlp_class(config)
-        self.post_mlp_norm = (
-            config.norm_class(config.n_embd, eps=config.norm_eps) if config.post_mlp_norm else nn.Identity()
-        )
-
-        self.config = config
+    @staticmethod
+    def create_self_attention(config: BaseConfig, block_idx: int) -> BaseCausalSelfAttention:
+        return CausalSelfAttention(config, block_idx)
 
 
 class CausalSelfAttention(BaseCausalSelfAttention):
@@ -100,11 +62,6 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             self.gating_factor = torch.nn.Parameter(torch.zeros(1, 1, config.n_head, 1))
             # kv cache for inference
             self.adapter_kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self.block_idx = block_idx
-        self.apply_sliding_window_attention = (
-            config.sliding_window_size is not None and
-            block_idx % config.sliding_window_layer_placing == 0
-        )
         self.config = config
 
     def scaled_dot_product_attention(
