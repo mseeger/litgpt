@@ -7,7 +7,8 @@ https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 """
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union, List
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -31,7 +32,6 @@ class GPT(nn.Module):
             )
         )
         self.mask_cache: Optional[torch.Tensor] = None
-        print(f"mask_cache = {self.mask_cache}")
         self.max_seq_length = self.config.block_size
 
     @property
@@ -44,7 +44,6 @@ class GPT(nn.Module):
         When doing inference, the sequences used might be shorter than the model's context length.
         This allows setting a smaller number to avoid allocating unused memory
         """
-        print("Called max_seq_length setter")
         if value > self.config.block_size:
             raise ValueError(f"Cannot attend to {value}, block size is only {self.config.block_size}."
                              " This is likely because the input text exceeds the supported context length of this model.")
@@ -59,7 +58,6 @@ class GPT(nn.Module):
             self.cos, self.sin = self.rope_cache(device=self.cos.device)
         # the mask and kv cache size will get updated on `set_kv_cache`. we cannot update it here because we don't know
         # if the kv cache is expected
-        print("Here we are")
         if self.mask_cache is not None and self.mask_cache.shape[-1] < value:
             print(f"Warning: KV cache has length {self.mask_cache.shape[-1]} < {value} = max_seq_length. Call 'set_kv_cache' before doing any forwards!")
 
@@ -81,7 +79,7 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         input_pos: Optional[torch.Tensor] = None,
         lm_head_chunk_size: int = 0,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -113,10 +111,19 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x, cos, sin, mask, input_pos)
         x = self.transformer.ln_f(x)
-        x = self.lm_head(x)  # (b, t, vocab_size)
-        if self.config.final_logit_softcapping is not None:
-            x = torch.tanh(x / self.config.final_logit_softcapping) * self.config.final_logit_softcapping
-        return x
+        extra_map = (
+            partial(do_softcapping, thresh=self.config.final_logit_softcapping)
+            if self.config.final_logit_softcapping is not None
+            else nn.Identity()
+        )
+        if lm_head_chunk_size > 1:
+            # chunk the lm head logits to reduce the peak memory used by autograd
+            return [
+                extra_map(self.lm_head(x_i))
+                for x_i in x.split(lm_head_chunk_size, dim=1)
+            ]
+        else:
+            return extra_map(self.lm_head(x))  # (b, t, vocab_size)
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -361,9 +368,7 @@ class CausalSelfAttention(nn.Module):
         if self.config.attention_logit_softcapping is not None:
             scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
             scores = q @ k.mT * scale
-            scores = (
-                torch.tanh(scores / self.config.attention_logit_softcapping) * self.config.attention_logit_softcapping
-            )
+            scores = do_softcapping(scores, self.config.attention_logit_softcapping)
             if mask is None:
                 mask = torch.ones(q.size(2), q.size(2), dtype=q.dtype, device=q.device).triu(diagonal=1)
                 mask.masked_fill_(mask.bool(), torch.finfo(q.dtype).min)
@@ -596,6 +601,10 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
     roped = (x * cos) + (rotated * sin)
     return roped.to(dtype=x.dtype)
+
+
+def do_softcapping(x: torch.Tensor, thresh: float) -> torch.Tensor:
+    return torch.tanh(x / thresh) * thresh
 
 
 class KVCache(nn.Module):

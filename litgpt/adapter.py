@@ -35,49 +35,20 @@ class GPT(BaseModel):
     the `Block` saves the layer index and passes it down to the attention layer."""
 
     def __init__(self, config: Config) -> None:
-        super().__init__(config)
+        nn.Module.__init__(self)
+        assert config.padded_vocab_size is not None
+        self.config = config
 
-    def forward(
-        self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, lm_head_chunk_size: int = 0
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        T = idx.size(1)
-        if self.max_seq_length < T:
-            raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
-
-        if input_pos is not None:  # use the kv cache
-            cos = batched_index_select(self.cos, 0, input_pos)
-            sin = batched_index_select(self.sin, 0, input_pos)
-            if self.mask_cache is None:
-                raise TypeError("You need to call `gpt.set_kv_cache()`")
-            mask = batched_index_select(self.mask_cache, 2, input_pos)
-            if mask.dim() > 4:
-                # the mask cache has a batch dim of 1 in addition to the one
-                # we get if input_pos has a batch dimension
-                mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
-            # Shorten final dimension so it just covers all `input_pos` entries
-            covering_length = KVCache.covering_length(input_pos)
-            if covering_length > self.max_seq_length:
-                raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
-            mask = mask[..., :covering_length]
-        else:
-            cos = self.cos[:T].unsqueeze(0)
-            sin = self.sin[:T].unsqueeze(0)
-            mask = None
-
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        if self.config.scale_embeddings:
-            x = x * (self.config.n_embd**0.5)
-
-        for block in self.transformer.h:
-            x = block(x, cos, sin, mask, input_pos)
-        x = self.transformer.ln_f(x)
-        if lm_head_chunk_size > 0:
-            # chunk the lm head logits to reduce the peak memory used by autograd
-            return [self.lm_head(x_i) for x_i in x.split(lm_head_chunk_size, dim=1)]
-        x = self.lm_head(x)  # (b, t, vocab_size)
-        if self.config.final_logit_softcapping is not None:
-            x = torch.tanh(x / self.config.final_logit_softcapping) * self.config.final_logit_softcapping
-        return x
+        self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+            )
+        )
+        self.mask_cache: Optional[torch.Tensor] = None
+        self.max_seq_length = self.config.block_size
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
