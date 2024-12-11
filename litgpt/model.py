@@ -96,8 +96,37 @@ class GPT(nn.Module):
         self,
         idx: torch.Tensor,
         input_pos: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
         lm_head_chunk_size: int = 0,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        If `input_pos` is given, the KV cache is used for K, V vectors at
+        positions smaller than entries in `input_pos`. Consider passing the
+        maximum of its entries plus 1 in `input_pos_maxp1` if this value is
+        determined by your forward algorithm anyway. If so, the multi-head
+        attention computation is sped up by slicing the KV cache buffers
+        accordingly. If `input_pos_maxp1` is not given, the MHA computation
+        is done with complete KV cache buffers (length 'max_seq_length`), and
+        masking is applied. We cannot compute `input_pos_maxp1` from
+        `input_pos`, since this would induce graph breaks and prevent graph
+        compilation.
+
+        Args:
+            idx: Token indices of input sequences, shape `(B, T)`, where `B`
+                is batch size.
+            input_pos: Optional. Positions of input tokens. The default is
+                `arange(T)`. Can have shape `(T,)` or `(B, T)` (batched index).
+            input_pos_maxp1: Optional. See above.
+            lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
+                `lm_head` computation is done in chunks of this size.
+
+        Returns:
+            Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
+            `lm_head_chunk_size > 0`, this is a list of chunks of shape
+            `(B, lm_head_chunk_size, config.padded_vocab_size)`, the final
+            entry can be shorter.
+
+        """
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -112,15 +141,16 @@ class GPT(nn.Module):
                 # the mask cache has a batch dim of 1 in addition to the one
                 # we get if input_pos has a batch dimension
                 mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
-            # Shorten final dimension so it just covers all `input_pos` entries
-            covering_length = KVCache.covering_length(input_pos)
-            if covering_length > self.max_seq_length:
-                raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
-            mask = mask[..., :covering_length]
+            if input_pos_maxp1 is not None:
+                # Shorten final dimension so it just covers all `input_pos` entries
+                if input_pos_maxp1 > self.max_seq_length:
+                    raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
+                mask = mask[..., :input_pos_maxp1]
         else:
             cos = self.cos[:T]
             sin = self.sin[:T]
             mask = None
+            input_pos_maxp1 = None
         if cos.dim() == 2:
             cos = cos.unsqueeze(0)
             sin = sin.unsqueeze(0)
@@ -130,14 +160,14 @@ class GPT(nn.Module):
             x = x * (self.config.n_embd**0.5)
 
         for block in self.transformer.h:
-            x = block(x, cos, sin, mask, input_pos)
+            x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
         x = self.transformer.ln_f(x)
         extra_map = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
             if self.config.final_logit_softcapping is not None
             else nn.Identity()
         )
-        if lm_head_chunk_size > 1:
+        if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
             return [
                 extra_map(self.lm_head(x_i))
@@ -251,6 +281,7 @@ class Block(nn.Module):
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -274,7 +305,9 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos)
+        attention_output = self.attn(
+            x_normed, cos, sin, mask, input_pos, input_pos_maxp1
+        )
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -324,6 +357,7 @@ class CausalSelfAttention(nn.Module):
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
+        input_pos_maxp1: Optional[int] = None,
     ) -> torch.Tensor:
         n_head = self.config.n_head
         n_query_groups = self.config.n_query_groups
@@ -343,33 +377,30 @@ class CausalSelfAttention(nn.Module):
         # q: (B, n_query_groups, q_per_kv, T, head_size)
         # k, v: (B, n_query_groups, 1, T, head_size)
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
-        print(f"input_pos={input_pos}\ncos.shape={cos.shape}, sin.shape={sin.shape}")
-        print(f"B={B}, T={T}, n_head={n_head}, n_query_groups={n_query_groups}, q_per_kv={q_per_kv}, rope_n_elem={rope_n_elem}")
-        if mask is not None:
-            print(f"mask.shape={mask.shape}")
-        print(f"[1] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         q_roped = apply_rope(q[..., : rope_n_elem], cos, sin)
         k_roped = apply_rope(k[..., : rope_n_elem], cos, sin)
         q = torch.cat((q_roped, q[..., rope_n_elem :]), dim=-1)
         k = torch.cat((k_roped, k[..., rope_n_elem :]), dim=-1)
-        print(f"[2] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         if input_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
             k, v = self.kv_cache(input_pos, k.squeeze(2), v.squeeze(2))
+            if input_pos_maxp1 is not None:
+                # Subselect along sequence dimension
+                k = k[..., :input_pos_maxp1, :]
+                v = v[..., :input_pos_maxp1, :]
             k = k.unsqueeze(2)
             v = v.unsqueeze(2)
-            # k, v: (B, n_query_groups, 1, covering_length, head_size)
-            print(f"[3] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
+            # k, v: (B, n_query_groups, 1, input_pos_maxp1, head_size)
+            # If input_pos_maxp1 is None -> max_seq_length
 
         # Expand `k`, `v` so their initial dimensions match `q`
         if q_per_kv > 1:
             new_shape = k.shape[0:2] + (q_per_kv,) + k.shape[3:]
             k = k.expand(*new_shape)
             v = v.expand(*new_shape)
-            print(f"[4] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         # Reshape q to (B, n_head, T, head_size). If input_pos is None, k
         # and v have the same shape. Otherwise, their new shape is
@@ -377,7 +408,6 @@ class CausalSelfAttention(nn.Module):
         q = q.flatten(start_dim=1, end_dim=2)
         k = k.flatten(start_dim=1, end_dim=2)
         v = v.flatten(start_dim=1, end_dim=2)
-        print(f"[5] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         if self.apply_sliding_window_attention:
             """
@@ -578,8 +608,13 @@ def build_rope_cache(
 
     # Calculate the product of position index and $\theta_i$
     idx_theta = torch.outer(seq_idx, theta).repeat(1, 2)
-    # Happens if n_elem is odd:
-    if idx_theta.shape[-1] > n_elem:
+    # If `n_elem` is odd, the final dimension of `idx_theta` has size
+    # `n_elem + 1`, so need to cut something off.
+    # Due to a current bug in Hugging Face, in the case `n_elem == 1`, we leave
+    # `idx_theta`, `cos`, `sin` as is. Things work out in `apply_rope` due to
+    # broadcasting. If we shorten `idx_theta`, unit tests comparing to
+    # Hugging Face fail.
+    if idx_theta.shape[-1] > n_elem > 1:
         idx_theta = idx_theta[..., :n_elem]
 
     return torch.cos(idx_theta), torch.sin(idx_theta)
@@ -696,9 +731,7 @@ class KVCache(nn.Module):
         """
         Writes new values `k`, `v` into cache at positions in `input_pos` along
         the sequence dimension. Their batch size `bs` must be `<= batch_size`.
-        Returns the buffers, sliced with range `0:seq_length` along sequence
-        dimension, where `seq_length = covering_length(input_pos)` is one larger
-        than the maximum entry in `input_pos`.
+        Returns the complete buffers, selected to batch size `bs`.
 
         Args:
             input_pos: Position index, `(bs, T)` or `(T,)`
@@ -706,7 +739,7 @@ class KVCache(nn.Module):
             v: New values, `(bs, n_query_groups, T, head_size)`
 
         Returns:
-            k_full, v_full, `(bs, n_query_groups, seq_length, head_size)`
+            k_full, v_full, `(bs, n_query_groups, max_seq_length, head_size)`
 
         """
         # move the buffer to the activation dtype for when AMP is used
@@ -716,17 +749,11 @@ class KVCache(nn.Module):
         bs = k.size(0)
         k = batched_index_copy_(self.k[:bs, ...], -2, input_pos, k)
         v = batched_index_copy_(self.v[:bs, ...], -2, input_pos, v)
-        # Sequence dimension only needs to cover all positions in `input_pos`
-        seq_length = self.covering_length(input_pos)
-        return k[..., :seq_length, :], v[..., :seq_length, :]
+        return k, v
 
     def reset_parameters(self) -> None:
         torch.nn.init.zeros_(self.k)
         torch.nn.init.zeros_(self.v)
-
-    @staticmethod
-    def covering_length(input_pos: torch.Tensor) -> int:
-        return int(input_pos.flatten().max().item()) + 1
 
 
 def build_mask_cache(max_seq_length: int, device: Optional[torch.device] = None) -> torch.Tensor:
