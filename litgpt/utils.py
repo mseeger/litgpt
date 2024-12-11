@@ -21,6 +21,7 @@ import warnings
 import lightning as L
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils._device
 import yaml
 from lightning.fabric.loggers import CSVLogger, TensorBoardLogger
@@ -309,13 +310,13 @@ def chunked_cross_entropy(
             logits = torch.cat(logits, dim=1)
             logits = logits.reshape(-1, logits.size(-1))
             targets = targets.reshape(-1)
-            return torch.nn.functional.cross_entropy(logits, targets, ignore_index=ignore_index)
+            return F.cross_entropy(logits, targets, ignore_index=ignore_index)
 
         # chunk cross entropy
         logit_chunks = [logit_chunk.reshape(-1, logit_chunk.size(-1)) for logit_chunk in logits]
         target_chunks = [target_chunk.reshape(-1) for target_chunk in targets.split(logits[0].size(1), dim=1)]
         loss_chunks = [
-            torch.nn.functional.cross_entropy(logit_chunk, target_chunk, ignore_index=ignore_index, reduction="none")
+            F.cross_entropy(logit_chunk, target_chunk, ignore_index=ignore_index, reduction="none")
             for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
         ]
         non_masked_elems = (targets != ignore_index).sum()
@@ -326,13 +327,13 @@ def chunked_cross_entropy(
     logits = logits.reshape(-1, logits.size(-1))
     targets = targets.reshape(-1)
     if chunk_size == 0:
-        return torch.nn.functional.cross_entropy(logits, targets, ignore_index=ignore_index)
+        return F.cross_entropy(logits, targets, ignore_index=ignore_index)
 
     # lm_head wasn't chunked, chunk cross entropy
     logit_chunks = logits.split(chunk_size)
     target_chunks = targets.split(chunk_size)
     loss_chunks = [
-        torch.nn.functional.cross_entropy(logit_chunk, target_chunk, ignore_index=ignore_index, reduction="none")
+        F.cross_entropy(logit_chunk, target_chunk, ignore_index=ignore_index, reduction="none")
         for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
     ]
     non_masked_elems = (targets != ignore_index).sum()

@@ -12,6 +12,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
@@ -117,9 +118,12 @@ class GPT(nn.Module):
                 raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
             mask = mask[..., :covering_length]
         else:
-            cos = self.cos[:T].unsqueeze(0)
-            sin = self.sin[:T].unsqueeze(0)
+            cos = self.cos[:T]
+            sin = self.sin[:T]
             mask = None
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
 
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         if self.config.scale_embeddings:
@@ -339,11 +343,17 @@ class CausalSelfAttention(nn.Module):
         # q: (B, n_query_groups, q_per_kv, T, head_size)
         # k, v: (B, n_query_groups, 1, T, head_size)
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=2)
+        print(f"input_pos={input_pos}\ncos.shape={cos.shape}, sin.shape={sin.shape}")
+        print(f"B={B}, T={T}, n_head={n_head}, n_query_groups={n_query_groups}, q_per_kv={q_per_kv}, rope_n_elem={rope_n_elem}")
+        if mask is not None:
+            print(f"mask.shape={mask.shape}")
+        print(f"[1] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         q_roped = apply_rope(q[..., : rope_n_elem], cos, sin)
         k_roped = apply_rope(k[..., : rope_n_elem], cos, sin)
         q = torch.cat((q_roped, q[..., rope_n_elem :]), dim=-1)
         k = torch.cat((k_roped, k[..., rope_n_elem :]), dim=-1)
+        print(f"[2] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         if input_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
@@ -352,12 +362,14 @@ class CausalSelfAttention(nn.Module):
             k = k.unsqueeze(2)
             v = v.unsqueeze(2)
             # k, v: (B, n_query_groups, 1, covering_length, head_size)
+            print(f"[3] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         # Expand `k`, `v` so their initial dimensions match `q`
         if q_per_kv > 1:
             new_shape = k.shape[0:2] + (q_per_kv,) + k.shape[3:]
             k = k.expand(*new_shape)
             v = v.expand(*new_shape)
+            print(f"[4] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         # Reshape q to (B, n_head, T, head_size). If input_pos is None, k
         # and v have the same shape. Otherwise, their new shape is
@@ -365,6 +377,7 @@ class CausalSelfAttention(nn.Module):
         q = q.flatten(start_dim=1, end_dim=2)
         k = k.flatten(start_dim=1, end_dim=2)
         v = v.flatten(start_dim=1, end_dim=2)
+        print(f"[5] q.shape={q.shape}\nk.shape={k.shape}\nv.shape={v.shape}")
 
         if self.apply_sliding_window_attention:
             """
@@ -406,10 +419,10 @@ class CausalSelfAttention(nn.Module):
                 mask = torch.ones(q.size(2), q.size(2), dtype=q.dtype, device=q.device).triu(diagonal=1)
                 mask.masked_fill_(mask.bool(), torch.finfo(q.dtype).min)
             scores = scores + mask
-            scores = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
+            scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
             y = scores @ v
         else:
-            y = torch.nn.functional.scaled_dot_product_attention(
+            y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
             )
         return y.transpose(1, 2)
@@ -458,7 +471,7 @@ class GptNeoxMLP(TransformerBlockMLP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc(x)
-        x = torch.nn.functional.gelu(x, approximate=self.config.gelu_approximate)
+        x = F.gelu(x, approximate=self.config.gelu_approximate)
         return self.proj(x)
 
 
@@ -473,7 +486,7 @@ class LLaMAMLP(TransformerBlockMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc_1 = self.fc_1(x)
         x_fc_2 = self.fc_2(x)
-        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        x = F.silu(x_fc_1) * x_fc_2
         return self.proj(x)
 
 
@@ -481,7 +494,7 @@ class GemmaMLP(LLaMAMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc_1 = self.fc_1(x)
         x_fc_2 = self.fc_2(x)
-        x = torch.nn.functional.gelu(x_fc_1, approximate=self.config.gelu_approximate) * x_fc_2
+        x = F.gelu(x_fc_1, approximate=self.config.gelu_approximate) * x_fc_2
         return self.proj(x)
 
 
@@ -565,6 +578,9 @@ def build_rope_cache(
 
     # Calculate the product of position index and $\theta_i$
     idx_theta = torch.outer(seq_idx, theta).repeat(1, 2)
+    # Happens if n_elem is odd:
+    if idx_theta.shape[-1] > n_elem:
+        idx_theta = idx_theta[..., :n_elem]
 
     return torch.cos(idx_theta), torch.sin(idx_theta)
 
@@ -640,7 +656,7 @@ def batched_index_copy_(t, dim, idx, val):
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     # x: (B, ..., T, head_size)
     # cos, sin: (B, T, head_size) or (1, T, head_size)
-    head_size_half = x.size(-1)
+    head_size_half = x.size(-1) // 2
     x1 = x[..., : head_size_half]  # (B, ..., T, head_size/2)
     x2 = x[..., head_size_half :]  # (B, ..., T, head_size/2)
     rotated = torch.cat((-x2, x1), dim=-1)  # (B, ..., T, head_size)
@@ -660,6 +676,11 @@ def do_softcapping(x: torch.Tensor, thresh: float) -> torch.Tensor:
 
 
 class KVCache(nn.Module):
+    """
+    Buffers `k`, `v` have shape
+    `(batch_size, n_query_groups, max_seq_length, head_size)`. Call dimension
+    2 the sequence dimension.
+    """
     def __init__(
         self,
         k_shape: Tuple[int, int, int, int],
@@ -672,6 +693,22 @@ class KVCache(nn.Module):
         self.register_buffer("v", torch.zeros(v_shape, device=device, dtype=dtype), persistent=False)
 
     def forward(self, input_pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Writes new values `k`, `v` into cache at positions in `input_pos` along
+        the sequence dimension. Their batch size `bs` must be `<= batch_size`.
+        Returns the buffers, sliced with range `0:seq_length` along sequence
+        dimension, where `seq_length = covering_length(input_pos)` is one larger
+        than the maximum entry in `input_pos`.
+
+        Args:
+            input_pos: Position index, `(bs, T)` or `(T,)`
+            k: New values, `(bs, n_query_groups, T, head_size)`
+            v: New values, `(bs, n_query_groups, T, head_size)`
+
+        Returns:
+            k_full, v_full, `(bs, n_query_groups, seq_length, head_size)`
+
+        """
         # move the buffer to the activation dtype for when AMP is used
         self.k = self.k.to(k.dtype)
         self.v = self.v.to(v.dtype)
@@ -679,9 +716,9 @@ class KVCache(nn.Module):
         bs = k.size(0)
         k = batched_index_copy_(self.k[:bs, ...], -2, input_pos, k)
         v = batched_index_copy_(self.v[:bs, ...], -2, input_pos, v)
-        # Final dimension only needs to cover all positions in `input_pos`
-        final_length = self.covering_length(input_pos)
-        return k[..., :final_length], v[..., :final_length]
+        # Sequence dimension only needs to cover all positions in `input_pos`
+        seq_length = self.covering_length(input_pos)
+        return k[..., :seq_length, :], v[..., :seq_length, :]
 
     def reset_parameters(self) -> None:
         torch.nn.init.zeros_(self.k)
