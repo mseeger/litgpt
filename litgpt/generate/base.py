@@ -78,10 +78,10 @@ def next_token(
     input_pos: torch.Tensor,
     x: torch.Tensor,
     input_pos_maxp1: Optional[int] = None,
-    **kwargs: Dict[str, Any],
+    **sample_kwargs: Dict[str, Any],
 ) -> torch.Tensor:
     logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1)
-    _next = sample(logits, **kwargs).to(dtype=torch.int64)
+    _next = sample(logits, **sample_kwargs).to(dtype=torch.int64)
     return _next
 
 
@@ -182,10 +182,10 @@ def generate_fn(
             model,
             input_pos,
             token.view(1, -1),
+            input_pos_maxp1=input_pos_maxp1,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            input_pos_maxp1=input_pos_maxp1,
         )
         tokens.append(token)
         int_token = token.item()
