@@ -615,6 +615,7 @@ def build_rope_cache(
     # `idx_theta`, `cos`, `sin` as is. Things work out in `apply_rope` due to
     # broadcasting. If we shorten `idx_theta`, unit tests comparing to
     # Hugging Face fail.
+    # https://github.com/huggingface/transformers/issues/35233
     if idx_theta.shape[-1] > n_elem > 1:
         idx_theta = idx_theta[..., :n_elem]
 
