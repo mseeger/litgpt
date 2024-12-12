@@ -234,4 +234,23 @@ def test_rope_llama_3_2():
     theirs_q_rot, theirs_k_rot = apply_rotary_pos_emb_llama(queries, keys, theirs_cos, theirs_sin)
     torch.testing.assert_close(theirs_q_rot, ours_q_rot)
     torch.testing.assert_close(theirs_k_rot, ours_k_rot)
-    
+
+@torch.inference_mode()
+def test_rope_cos_sin_shapes_if_rope_n_elem_is_odd():
+    bs, seq_len, n_head, n_embed = 1, 6, 2, 8
+    head_size = n_embed // n_head  # 4
+    rotary_percentage = 0.75
+    rope_n_elem = int(head_size * rotary_percentage)  # 3
+    ours_cos, ours_sin = build_rope_cache(seq_len, rope_n_elem)
+    required_shape = (seq_len, rope_n_elem)
+    assert ours_cos.shape == required_shape
+    assert ours_sin.shape == required_shape
+    # Special case: If `rope_n_elem == 1`, the shape is extended. This is to
+    # accommodate a current bug in Hugging Face, ensuring that other unit tests
+    # pass.
+    rotary_percentage = 0.25
+    rope_n_elem = int(head_size * rotary_percentage)  # 1
+    ours_cos, ours_sin = build_rope_cache(seq_len, rope_n_elem)
+    required_shape = (seq_len, rope_n_elem + 1)
+    assert ours_cos.shape == required_shape
+    assert ours_sin.shape == required_shape
