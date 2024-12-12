@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 from pprint import pprint
-from typing import Any, Literal, Optional, Tuple, List, Union, Iterator
+from typing import Any, Literal, Optional, Tuple, List, Union, Iterator, Dict
 import warnings
 
 import lightning as L
@@ -73,8 +73,13 @@ def sample(
     return torch.argmax(logits, dim=-1, keepdim=True)
 
 
-def next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-    input_pos_maxp1 = kwargs.get("input_pos_maxp1")
+def next_token(
+    model: GPT,
+    input_pos: torch.Tensor,
+    x: torch.Tensor,
+    input_pos_maxp1: Optional[int] = None,
+    **kwargs: Dict[str, Any],
+) -> torch.Tensor:
     logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1)
     _next = sample(logits, **kwargs).to(dtype=torch.int64)
     return _next

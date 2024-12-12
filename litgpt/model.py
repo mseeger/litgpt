@@ -583,6 +583,7 @@ def build_rope_cache(
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Cosine and sine caches for RoPE.
+            Shapes are `(seq_len, n_elem)`.
     """
 
     # Compute the inverse frequencies theta
@@ -689,6 +690,18 @@ def batched_index_copy_(t, dim, idx, val):
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Applies RoPE transform to `x`. Note that `cos`, `sin` need to have a batch
+    dimension.
+
+    Args:
+        x: Input tensor, `(B, ..., T, head_size)`
+        cos: Cached cosines, `(B, T, head_size)` or `(1, T, head_size)`
+        sin: Cached sines, `(B, T, head_size)` or `(1, T, head_size)`
+
+    Returns:
+        Encoded tensor, `(B, ..., T, head_size)`
+    """
     # x: (B, ..., T, head_size)
     # cos, sin: (B, T, head_size) or (1, T, head_size)
     head_size_half = x.size(-1) // 2
