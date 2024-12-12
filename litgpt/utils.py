@@ -626,17 +626,13 @@ def auto_download_checkpoint(model_name, access_token=None, ignore_tokenizer_fil
     try:
         check_valid_checkpoint_dir(checkpoint_dir, verbose=False, raise_error=True, ignore_tokenizer_files=ignore_tokenizer_files)
     except FileNotFoundError as e:
-        print("I AM HERE!")
         if access_token is None:
             access_token = os.getenv("HF_TOKEN")
 
-        print(f"parts[0] = {checkpoint_dir.parts[0]}, absolute = {checkpoint_dir.is_absolute()}")
         if checkpoint_dir.parts[0] != "checkpoints" and not checkpoint_dir.is_absolute():
-            print("AND ALSO HERE")
             download_from_hub(repo_id=str(model_name), access_token=access_token)
             checkpoint_dir = Path("checkpoints") / checkpoint_dir
         else:
-            print("NO, HERE!!")
             raise e
 
     return checkpoint_dir

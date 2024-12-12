@@ -45,7 +45,7 @@ two matrices of a lower rank.
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Type, Union
+from typing import Any, Dict, Tuple, Type, Union, Optional
 
 import torch
 import torch.nn as nn
@@ -581,17 +581,35 @@ class CausalSelfAttention(BaseCausalSelfAttention):
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
+def create_lora_linear_for_mlp(
+    config: Config,
+    in_size: int,
+    out_size: int,
+    bias: Optional[Union[float, bool]] = None,
+) -> LoRALinear:
+    if bias is None:
+        bias = config.bias
+    return LoRALinear(
+        in_size,
+        out_size,
+        bias=bias,
+        r=(config.lora_r if config.lora_mlp else 0),
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+    )
+
+
 class GptNeoxMLP(litgpt.model.GptNeoxMLP):
     @staticmethod
     def create_fc(config: Config) -> nn.Module:
-        return LoRALinear(
-            config.n_embd, config.intermediate_size, bias=config.bias
+        return create_lora_linear_for_mlp(
+            config, config.n_embd, config.intermediate_size
         )
 
     @staticmethod
     def create_proj(config: Config) -> nn.Module:
-        return LoRALinear(
-            config.intermediate_size, config.n_embd, bias=config.bias
+        return create_lora_linear_for_mlp(
+            config, config.intermediate_size, config.n_embd
         )
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
@@ -609,14 +627,14 @@ class GptNeoxMLP(litgpt.model.GptNeoxMLP):
 class LLaMAMLP(litgpt.model.LLaMAMLP):
     @staticmethod
     def create_fc(config: Config) -> nn.Module:
-        return LoRALinear(
-            config.n_embd, config.intermediate_size, bias=config.bias
+        return create_lora_linear_for_mlp(
+            config, config.n_embd, config.intermediate_size
         )
 
     @staticmethod
     def create_proj(config: Config) -> nn.Module:
-        return LoRALinear(
-            config.intermediate_size, config.n_embd, bias=config.bias
+        return create_lora_linear_for_mlp(
+            config, config.intermediate_size, config.n_embd
         )
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
@@ -644,13 +662,8 @@ class GemmaMLP(LLaMAMLP):
 class LLaMAMoE(litgpt.model.LLaMAMoE):
     @staticmethod
     def create_gate(config: Config) -> nn.Module:
-        return LoRALinear(
-            config.n_embd,
-            config.n_expert,
-            bias=False,
-            r=(config.lora_r if config.lora_mlp else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+        return create_lora_linear_for_mlp(
+            config, config.n_embd, config.n_expert, bias=False
         )
 
     @staticmethod
