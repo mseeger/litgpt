@@ -33,6 +33,8 @@ from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
+import litgpt.attention
+import litgpt.attention_utils
 import litgpt.config as config_module
 from litgpt import GPT, Config
 from litgpt.attention import DefaultKeysAndValues
@@ -49,7 +51,7 @@ from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_qwen_3,
 )
 from litgpt.scripts.convert_lit_checkpoint import qkv_reassemble as make_qkv_interleaved
-from litgpt.utils import _RunIf
+from litgpt.utils import _RunIf, batched_index_select
 
 
 @torch.inference_mode()

@@ -355,9 +355,7 @@ class CausalSelfAttention_OLD(torch.nn.Module):
         if self.config.attention_logit_softcapping is not None:
             dtype = torch.float32
             scores = q.to(dtype) @ k.mT.to(dtype) * scale
-            # self.debug_intermediates["scores1"] = scores
             scores = do_softcapping(scores, self.config.attention_logit_softcapping)
-            # self.debug_intermediates["scores2"] = scores
             if mask is None:
                 q_len = q.shape[2]
                 mask = torch.ones(
