@@ -1,7 +1,10 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
+import math
+import random
 from copy import deepcopy
 from functools import partial
+from typing import Optional
 
 import pytest
 import torch
@@ -35,6 +38,12 @@ from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 import litgpt.attention
 import litgpt.config as config_module
 from litgpt import GPT, Config
+from litgpt.attention import (
+    build_mask_cache,
+    build_mask_slice,
+    DefaultKeysAndValues,
+    scaled_dot_product_attention,
+)
 from litgpt.model import CausalSelfAttention
 from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_falcon,
@@ -48,7 +57,7 @@ from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_qwen_3,
 )
 from litgpt.scripts.convert_lit_checkpoint import qkv_reassemble as make_qkv_interleaved
-from litgpt.utils import _RunIf
+from litgpt.utils import _RunIf, batched_index_select
 
 
 @torch.inference_mode()
@@ -1560,3 +1569,121 @@ def test_rope_cos_sin_shapes_if_rope_n_elem_is_odd(rotary_percentage, final_dim)
     required_shape = (config.block_size, final_dim)
     assert model.cos.shape == required_shape
     assert model.sin.shape == required_shape
+
+
+@pytest.mark.parametrize(
+    ("n_head", "n_query_groups"),
+    (
+        (2, 1),
+        (4, 1),
+        (8, 4),
+        (12, 4),
+        (24, 8),
+        (9, 3),
+    ),
+)
+@torch.inference_mode()
+def test_scaled_dot_product_attention(n_head, n_query_groups):
+    seed = 31415927
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    num_repeats = 5
+    dtype = torch.bfloat16
+
+    for repeat in range(num_repeats):
+        head_size = 2 ** random.randint(3, 6)
+        batch_size = random.randint(1, 5)
+        len_key = random.randint(16, 128)
+        is_causal = repeat % 2 == 0
+        if is_causal:
+            len_query = len_key
+        elif repeat % 4 == 1:
+            len_query = random.randint(1, len_key // 2)
+        else:
+            len_query = 1
+        shape = (batch_size, n_head, len_query, head_size)
+        query = torch.randn(shape, dtype=dtype)
+        shape = (batch_size, n_query_groups, len_key, head_size)
+        key = torch.randn(shape, dtype=dtype)
+        value = torch.randn(shape, dtype=dtype)
+        k_and_v = DefaultKeysAndValues(key, value)
+        scale = 1.0 / math.sqrt(head_size)
+
+        result, scores = scaled_dot_product_attention(
+            query,
+            k_and_v,
+            scale=scale,
+            is_causal=is_causal,
+        )
+        q_per_kv = n_head // n_query_groups
+        key_bc = key.repeat_interleave(q_per_kv, dim=1)
+        value_bc = value.repeat_interleave(q_per_kv, dim=1)
+        k_and_v_bc = DefaultKeysAndValues(key_bc, value_bc)
+        result_cmp, scores_cmp = scaled_dot_product_attention(
+            query,
+            k_and_v_bc,
+            scale=scale,
+            is_causal=is_causal,
+        )
+        msg = (
+            f"bs={batch_size}, hs={head_size}, nh_q={n_head}, nh_k={n_query_groups}, len_q={len_query}, len_k={len_key}"
+        )
+        kwargs = dict(atol=0.0005, rtol=0.05)
+        torch.testing.assert_close(result, result_cmp, **kwargs), msg
+        torch.testing.assert_close(scores, scores_cmp, **kwargs), msg
+
+
+@pytest.mark.parametrize(
+    ("sliding_window_size", "batch_size", "n_query_groups"),
+    (
+        (None, 1, 1),
+        (None, 4, 16),
+        (4, 1, 1),
+        (4, 2, 32),
+        (128, 1, 1),
+        (128, 4, 16),
+    ),
+)
+@torch.inference_mode()
+def test_build_mask_slice(
+    sliding_window_size: Optional[int],
+    batch_size: int,
+    n_query_groups: int,
+):
+    seed = 31415927
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    num_repeats = 10
+    dtype = torch.bfloat16
+    device = torch.device("cpu")
+
+    for _ in range(num_repeats):
+        seq_len = random.randint(16, 256)
+        full_mask = build_mask_cache(seq_len, sliding_window_size, device, dtype)
+        input_pos = random.randint(1, seq_len - 1)
+        num = random.randint(1, min(16, seq_len - input_pos))
+        cache_length = random.randint(8, seq_len - 4)
+        token_positions = torch.zeros(
+            (batch_size, n_query_groups, cache_length),
+            dtype=torch.int64,
+            device=device,
+        )
+        for bs in range(batch_size):
+            for nq in range(n_query_groups):
+                token_positions[bs, nq, :] = torch.randperm(
+                    seq_len, device=device,
+                )[:cache_length]
+        mask = build_mask_slice(
+            input_pos=input_pos,
+            num=num,
+            token_positions=token_positions,
+            dtype=dtype,
+            device=device,
+            sliding_window_size=sliding_window_size,
+        )
+        mask_cmp = batched_index_select(
+            full_mask[input_pos: (input_pos + num), :],
+            dim=1,
+            idx=token_positions,
+        )
+        torch.testing.assert_close(mask, mask_cmp)

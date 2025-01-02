@@ -91,6 +91,7 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
     tokenizer_mock = Mock()
     tokenizer_mock.return_value.encode.return_value = torch.tensor([1, 2, 3])
     tokenizer_mock.return_value.decode.return_value = "foo bar baz"
+    tokenizer_mock.return_value.eos_id.return_value = 255  # TODO (does not work)
     monkeypatch.setattr(generate, "Tokenizer", tokenizer_mock)
     generate_mock = Mock()
     generate_mock.return_value = torch.tensor(
