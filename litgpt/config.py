@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional, Type, Union
+from typing import Any, Callable, Literal, Optional, Type, Union
 
 import torch
 import yaml
@@ -84,6 +84,11 @@ class Config:
     # The base period of the RoPE embeddings for local attention.
     # If not provided, rope_theta will be used for both local and global attention.
     rope_local_base_freq: Optional[float] = None
+    # This hook is called in `GPT.forward` at the start of each layer,
+    # passing the (detached) layer input and the layer index. It is also called
+    # with the final layer output (which is the input into the head block),
+    # passing `n_layer` as second argument.
+    start_of_layer_hook: Optional[Callable[[torch.Tensor, int], None]] = None
 
     def __post_init__(self):
         if not self.name:
