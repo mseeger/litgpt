@@ -553,31 +553,6 @@ def capture_hparams() -> Dict[str, Any]:
     return hparams
 
 
-def save_hyperparameters(function: callable, checkpoint_dir: Path) -> None:
-    """Captures the CLI parameters passed to `function` without running `function` and saves them to the checkpoint."""
-    from jsonargparse import capture_parser
-
-    # TODO: Make this more robust
-    # This hack strips away the subcommands from the top-level CLI
-    # to parse the file as if it was called as a script
-    known_commands = [
-        ("finetune_full",),  # For subcommands, use `("finetune", "full")` etc
-        ("finetune_lora",),
-        ("finetune_adapter",),
-        ("finetune_adapter_v2",),
-        ("finetune",),
-        ("pretrain",),
-    ]
-    for known_command in known_commands:
-        unwanted = slice(1, 1 + len(known_command))
-        if tuple(sys.argv[unwanted]) == known_command:
-            sys.argv[unwanted] = []
-
-    parser = capture_parser(lambda: CLI(function))
-    config = parser.parse_args()
-    parser.save(config, checkpoint_dir / "hyperparameters.yaml", overwrite=True)
-
-
 def save_config(config: "Config", checkpoint_dir: Path) -> None:
     config_dict = asdict(config)
     with open(checkpoint_dir / "model_config.yaml", "w", encoding="utf-8") as fp:
@@ -928,3 +903,22 @@ def kill_process_tree(pid: int):
         parent.kill()
     except psutil.NoSuchProcess:
         pass  # Process already exited
+
+
+def batched_index_select(t: torch.Tensor, dim: int, idx: torch.Tensor) -> torch.Tensor:
+    """index_select for batched index and unbatched t"""
+    if idx.ndim == 1:
+        return torch.index_select(t, dim, idx)
+
+    *batch_shape, idx_size = idx.shape
+    res = torch.index_select(t, dim, idx.reshape(-1))  # flat index
+    # split out single batch idx
+    res = res.view(*t.shape[:dim], -1, idx_size, *t.shape[dim + 1 :])
+    if dim > 0:
+        # move batch dim to front, this is np.rollaxis(res, dim, 0) for tensors
+        dims = [dim] + list(range(res.ndim))
+        del dims[dim + 1]
+        res = res.permute(dims)
+    # unflatten batch dims
+    res = res.view(*batch_shape, *res.shape[1:])
+    return res
