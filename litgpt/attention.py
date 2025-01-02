@@ -349,7 +349,6 @@ def build_mask_slice(
             `(eff_batch_size, n_query_groups, cache_length)`
         dtype: Data type of the output mask
         device: Device of the output mask
-        sliding_window_size: Parameter for sliding window attention
 
     Returns:
         Mask tensor, shape `(eff_batch_size, n_query_groups, num, cache_length)`
