@@ -9,10 +9,11 @@ https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 from functools import partial
 from typing import Any, List, Optional, Tuple, Union
 
+from typing_extensions import Self
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing_extensions import Self
 
 from litgpt.attention import (
     DefaultKeysAndValues,
@@ -245,6 +246,8 @@ class GPT(nn.Module):
             )
         if batch_size != params.batch_size:
             raise ValueError(f"kv_cache.batch_size = {params.batch_size}, must be {batch_size}")
+        if dtype != params.dtype:
+            raise ValueError(f"kv_cache.dtype = {params.dtype}, must be {dtype}")
         if dtype != params.dtype:
             raise ValueError(f"kv_cache.dtype = {params.dtype}, must be {dtype}")
 
