@@ -44,7 +44,7 @@ def test_scaled_dot_product_attention(n_head, n_query_groups):
     seed = 31415927
     random.seed(seed)
     torch.random.manual_seed(seed)
-    num_repeats = 5
+    num_repeats = 32
     dtype = torch.bfloat16
     mask_kwargs = dict(dtype=dtype, device=torch.device("cpu"))
     assert_kwargs = dict(atol=0.0005, rtol=0.05)
@@ -125,7 +125,7 @@ def test_build_mask_slice(
     seed = 31415927
     random.seed(seed)
     torch.random.manual_seed(seed)
-    num_repeats = 10
+    num_repeats = 30
     dtype = torch.bfloat16
     device = torch.device("cpu")
 
