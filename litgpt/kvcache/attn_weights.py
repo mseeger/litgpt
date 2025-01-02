@@ -33,9 +33,16 @@ class AttnWeightsKVCache(KVCache):
         if cache_length <= 0:
             raise ValueError("cache_length must be positive integer")
         self.cache_length = cache_length
-        # Slot position where :meth:`forward` writes new key, value tensors.
+        shape = (batch_size, self.n_query_groups, cache_length, self.head_size)
+        self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
+        self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
+        self.register_buffer("token_pos", torch.zeros(shape[:-1], device=device, dtype=torch.int), persistent=False)
+        # Slot positions where :meth:`forward` writes new key, value tensors.
+        # Integer array of shape `(batch_size, n_query_groups)`.
         # Initialized by :meth:`prefill`.
         self.next_position = None
+        # Next token position :meth:`forward` is called for
+        self.next_token_pos = None
         # Number of slots which are occupied. Grows until `cache_length`, then
         # stays there. Initialized by :meth:`prefill`.
         self.current_length = None
@@ -50,17 +57,23 @@ class AttnWeightsKVCache(KVCache):
         shape = (self.batch_size, self.n_query_groups, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
-        if key.dtype != self.dtype:
-            key = key.to(self.dtype)
-        if value.dtype != self.dtype:
-            value = value.to(self.dtype)
         if self.current_length == self.cache_length and not self.just_updated:
             raise IndexError("Need to call 'update' before calling 'forward'")
+        key = key.to(self.dtype)
+        value = value.to(self.dtype)
         # Write new content into slot
-        self.k[:, :, self.next_position, :] = key
-        self.v[:, :, self.next_position, :] = value
+        # `next_position` is batched index, shape `(batch_size, n_query_groups)`
+        index = self.next_position.unsqueeze(-1)
+        # `index[i, j, 0] = next_position[i, j]`
+        self.token_pos.scatter_(2, index, self.next_token_pos)
+        index = index.unsqueeze(-1).expand(-1, -1, 1, self.head_size)
+        # `index[i, j, 0, k] = next_position[i, j]`
+        self.k.scatter_(2, index, key.unsqueeze(2))
+        self.v.scatter_(2, index, value.unsqueeze(2))
         self.current_length = min(self.cache_length, self.current_length + 1)
         self.just_updated = False
+        self.next_position = None  # Set by next :meth:`update` call
+        self.next_token_pos += 1
         return self.k[:, :, :self.current_length, :], self.v[:, :, :self.current_length, :]
 
     def update(self, *args, **kwargs):
@@ -72,7 +85,7 @@ class AttnWeightsKVCache(KVCache):
         Args:
             attn_weights: Attention weights for the multi-head attention
                 computation done just after the last recent :meth:`forward` call.
-                Shape must be `(
+                Shape must be `(batch_size, n_head, current_length)`
         """
         if len(args) >= 1:
             attn_weights = args[0]
@@ -87,13 +100,23 @@ class AttnWeightsKVCache(KVCache):
             raise ValueError(f"Shape of attn_weights must be {shape}, but attn_weights.shape = {attn_weights.shape}")
         self._update(attn_weights)
         # Check post-conditions
-        if self.next_position is None or not (0 <= self.next_position < self.cache_length):
+        if self.next_position is None:
             raise IndexError("Error in '_update': self.next_position needs to be set")
-        if self.current_length < self.cache_length and self.next_position != self.current_length:
-            raise IndexError(f"Error in '_update': next_position = {self.next_position}, current_length = {self.current_length}, must be equal as long as cache not full")
         self.just_updated = True
 
     def _update(self, attn_weights: torch.Tensor):
+        """
+        Implementation of :meth:`update`, given the `attn_weights` array.
+        This method needs to set `next_position`, a batched index of shape
+        `(batch_size, n_query_groups)`. If `current_length < cache_length`,
+        this must be constant equal to `current_length` (see
+        :meth:`_set_next_position_constant`).
+
+        Args:
+            attn_weights: Attention weights for the multi-head attention
+                computation done just after the last recent :meth:`forward` call.
+                Shape must be `(batch_size, n_head, current_length)`
+        """
         raise NotImplementedError()
 
     def prefill(self, key: torch.Tensor, value: torch.Tensor):
@@ -121,7 +144,13 @@ class AttnWeightsKVCache(KVCache):
         self.k[:, :, :init_length, :] = key.to(self.dtype)
         self.v[:, :, :init_length, :] = value.to(self.dtype)
         self.current_length = init_length
+        self.next_token_pos = init_length
         if init_length < self.cache_length:
-            self.next_position = init_length
+            self._set_next_position_constant(init_length)
         else:
-            self.next_position = None
+            self.next_position = None  # Set by next :meth:`update` call
+
+    def _set_next_position_constant(self, val: int):
+        self.next_position = torch.full(
+            (1, 1), val, dtype=torch.int, device=self.device
+        ).expand(self.batch_size, self.n_query_groups)
