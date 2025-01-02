@@ -15,7 +15,11 @@ from litgpt.utils import check_valid_checkpoint_dir, extend_checkpoint_dir
 
 
 def merge_lora(
-    checkpoint_dir: Path, pretrained_checkpoint_dir: Optional[Path] = None, precision: Optional[str] = None
+    checkpoint_dir: Path,
+    pretrained_checkpoint_dir: Optional[Path] = None,
+    precision: Optional[str] = None,
+    lora_fname: str = "lit_model.pth.lora",
+    pretrained_fname: str = "lit_model.pth",
 ) -> None:
     """Merges the LoRA weights with the base model.
 
@@ -39,10 +43,10 @@ def merge_lora(
         pretrained_checkpoint_dir = extend_checkpoint_dir(pretrained_checkpoint_dir)
     pprint(locals())
 
-    check_valid_checkpoint_dir(checkpoint_dir, model_filename="lit_model.pth.lora")
+    check_valid_checkpoint_dir(checkpoint_dir, model_filename=lora_fname)
     if pretrained_checkpoint_dir is not None:
         check_valid_checkpoint_dir(pretrained_checkpoint_dir)
-    if (checkpoint_dir / "lit_model.pth").is_file():
+    if (checkpoint_dir / pretrained_fname).is_file():
         print("LoRA weights have already been merged in this checkpoint.")
         return
 
@@ -62,8 +66,8 @@ def merge_lora(
         model.cos = None
         model.sin = None
 
-    lora_path = checkpoint_dir / "lit_model.pth.lora"
-    pretrained_checkpoint = torch.load(str(pretrained_checkpoint_dir / "lit_model.pth"), mmap=True)
+    lora_path = checkpoint_dir / lora_fname
+    pretrained_checkpoint = torch.load(str(pretrained_checkpoint_dir / pretrained_fname), mmap=True)
     lora_checkpoint = torch.load(str(lora_path), mmap=True)
     lora_checkpoint = lora_checkpoint.get("model", lora_checkpoint)
 
@@ -77,10 +81,10 @@ def merge_lora(
 
     # Remove LoRA parameters and the LoRA linear substring
     state_dict = {k.replace("linear.", ""): v for k, v in model.state_dict().items() if not lora_filter(k, v)}
-    save_path = checkpoint_dir / "lit_model.pth"
+    save_path = checkpoint_dir / pretrained_fname
     torch.save(state_dict, save_path)
 
-    fabric.print(f"Saved merged weights to {str(checkpoint_dir / 'lit_model.pth')!r}")
+    fabric.print(f"Saved merged weights to {str(save_path)!r}")
 
 
 def load_lora_metadata(checkpoint_dir: Path) -> Tuple[Dict[str, Any], Path, Optional[str]]:

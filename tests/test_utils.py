@@ -39,9 +39,9 @@ from litgpt.utils import (
     instantiate_torch_optimizer,
     num_parameters,
     parse_devices,
-    save_hyperparameters,
     select_sft_generate_example,
 )
+from litgpt.parser_config import save_hyperparameters
 
 
 # match fails on windows. why did they have to use backslashes?

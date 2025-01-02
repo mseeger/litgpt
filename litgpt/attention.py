@@ -16,6 +16,7 @@ from litgpt.attention_utils import (
 )
 from litgpt.config import Config
 
+
 # Currently, `torch.nn.functional.scaled_dot_product_attention` does not
 # properly support the case `enabla_gqa=True` (i.e., keys and values have
 # less heads than queries). In this case, it is best to extend keys and
@@ -85,6 +86,13 @@ class DefaultKeysAndValues(KeysAndValues):
 
         """
         return True
+
+    def clear(self):
+        if self._keys is not None:
+            del self._keys
+            self._keys = None
+            del self._values
+            self._values = None
 
 
 class MultiHeadSelfAttention:

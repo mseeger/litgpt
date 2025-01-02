@@ -9,10 +9,11 @@ https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 from functools import partial
 from typing import Any, List, Optional, Tuple, Union
 
+from typing_extensions import Self
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing_extensions import Self
 
 from litgpt.attention import (
     DefaultKeysAndValues,
@@ -449,15 +450,9 @@ class GPT(nn.Module):
         )
 
     def clear_kv_caches(self) -> None:
-        """
-        Note that KV cache objects are removed only if they have not been
-        assigned with :meth:`assign_kv_caches`.
-
-        """
-        if self._default_kv_cache:
-            for block in self.transformer.h:
-                block.attn.kv_cache = None
-            self._default_kv_cache = False
+        for block in self.transformer.h:
+            block.attn.kv_cache = None
+        self._default_kv_cache = False
 
     def get_kv_cache_params(self, layer_idx: int) -> Optional[KVCacheParams]:
         """

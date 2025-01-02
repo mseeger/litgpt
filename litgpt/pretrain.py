@@ -39,8 +39,8 @@ from litgpt.utils import (
     parse_devices,
     reset_parameters,
     save_config,
-    save_hyperparameters,
 )
+from litgpt.parser_config import save_hyperparameters
 
 
 def setup(
