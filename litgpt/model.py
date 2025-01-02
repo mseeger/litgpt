@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
+from litgpt.kvcache import KVCache
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -652,56 +653,6 @@ def batched_index_select(t, dim, idx):
     return res
 
 
-def batched_index_copy_(t, dim, idx, val):
-    """Index copy for batched t, idx, val"""
-
-    if t.device.type == "mps":
-        # Normalize negative dimensions
-        if dim < 0:
-            dim = t.dim() + dim
-        if idx.dim() == 1:
-            idx_shape = [1] * val.dim()
-            idx_shape[dim] = -1
-            idx_expanded = idx.view(*idx_shape)
-            idx_expanded = idx_expanded.expand_as(val)
-            t.scatter_(dim, idx_expanded, val)
-            return t
-
-        elif idx.dim() == 2:
-            assert dim != 0, "Cannot index the batch dimension"
-            batch_size = idx.size(0)
-            idx_size = idx.size(1)
-            assert batch_size == t.size(0) == val.size(0)
-
-            idx_shape = [batch_size] + [1] * (val.dim() - 1)
-            idx_shape[dim] = idx_size
-            idx_expanded = idx.view(*idx_shape)
-            idx_expanded = idx_expanded.expand_as(val)
-
-            t.scatter_(dim, idx_expanded, val)
-            return t
-        else:
-            raise NotImplementedError(f"idx.dim() == {idx.dim()} not supported")
-
-    else:
-        if idx.dim() == 1:
-            return t.index_copy_(dim, idx, val)
-
-        assert idx.dim() == 2, f"multiple batch dims not yet {idx.shape=}"
-        assert dim != 0, f"cannot index batch dim {dim=}"
-        batch_size, idx_size = idx.shape
-        assert batch_size == t.size(0)
-        assert batch_size == val.size(0)
-
-        # if we can view the batch and indexed dimensions together, we could
-        # do index trickery. This is, sadly, not the case for kvcache so we
-        # fall back to for loop
-        for i in range(batch_size):
-            unbatched_dim = dim if dim < 0 else dim - 1
-            t[i].index_copy_(unbatched_dim, idx[i], val[i])
-        return t
-
-
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """
     Applies RoPE transform to `x`. Note that `cos`, `sin` need to have a batch
@@ -736,52 +687,6 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 def do_softcapping(x: torch.Tensor, thresh: float) -> torch.Tensor:
     return torch.tanh(x / thresh) * thresh
-
-
-class KVCache(nn.Module):
-    """
-    Buffers `k`, `v` have shape
-    `(batch_size, n_query_groups, max_seq_length, head_size)`.
-    """
-    def __init__(
-        self,
-        k_shape: Tuple[int, int, int, int],
-        v_shape: Tuple[int, int, int, int],
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
-        super().__init__()
-        self.register_buffer("k", torch.zeros(k_shape, device=device, dtype=dtype), persistent=False)
-        self.register_buffer("v", torch.zeros(v_shape, device=device, dtype=dtype), persistent=False)
-
-    def forward(self, input_pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Writes new values `k` and `v` into the cache at the positions specified
-        by `input_pos` along the sequence dimension (`max_seq_length`). The batch
-        size of `k` and `v` (`bs`) must be smaller or equal to `KVCache` batch
-        size. Returns the full buffers, adjusted to the batch size `bs`.
-
-        Args:
-            input_pos: Position index, `(bs, T)` or `(T,)`
-            k: New values, `(bs, n_query_groups, T, head_size)`
-            v: New values, `(bs, n_query_groups, T, head_size)`
-
-        Returns:
-            k_full, v_full, `(bs, n_query_groups, max_seq_length, head_size)`
-
-        """
-        # move the buffer to the activation dtype for when AMP is used
-        self.k = self.k.to(k.dtype)
-        self.v = self.v.to(v.dtype)
-        # update the cache
-        bs = k.size(0)
-        k = batched_index_copy_(self.k[:bs, ...], -2, input_pos, k)
-        v = batched_index_copy_(self.v[:bs, ...], -2, input_pos, v)
-        return k, v
-
-    def reset_parameters(self) -> None:
-        torch.nn.init.zeros_(self.k)
-        torch.nn.init.zeros_(self.v)
 
 
 def build_mask_cache(max_seq_length: int, device: Optional[torch.device] = None) -> torch.Tensor:

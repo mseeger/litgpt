@@ -32,7 +32,8 @@ from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 
 import litgpt.config as config_module
 from litgpt import GPT, Config
-from litgpt.model import CausalSelfAttention, batched_index_copy_
+from litgpt.model import CausalSelfAttention
+from litgpt.utils import batched_index_copy_
 from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_falcon,
     copy_weights_gemma_2,
