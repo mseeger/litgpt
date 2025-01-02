@@ -1,4 +1,3 @@
-from ast import Index
 from typing import Optional, Tuple
 
 import torch
@@ -11,7 +10,8 @@ class AttnWeightsKVCache(KVCache):
     """
     Base class for key-value caches which need attention weights to be passed
     (via :meth:`update`) in every round. In general, these weights are used to
-    compute scores, based on which eviction decisions are taken.
+    compute scores, based on which eviction decisions are taken. All of this
+    happens in :meth:`_update`, which subclasses need to implement.
     """
     def __init__(
         self,
@@ -25,7 +25,7 @@ class AttnWeightsKVCache(KVCache):
         Args:
             config: Model config
             batch_size: Inference batch size
-            cache_length: Number of slots (i.e., tokens) of cache
+            cache_length: Number of slots (i.e., tokens) in cache
             device: Device for buffers
             dtype: Data type for buffers
         """
@@ -43,18 +43,23 @@ class AttnWeightsKVCache(KVCache):
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.next_position is None:
-            raise IndexError("Cache needs to be initialized with 'prefill' before being used")
+            if self.current_length == self.cache_length:
+                raise IndexError("Need to call 'update' before calling 'forward'")
+            else:
+                raise IndexError("Cache needs to be initialized with 'prefill' before being used")
         shape = (self.batch_size, self.n_query_groups, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
-        if key.dtype != self.dtype or value.dtype != self.dtype:
-            raise ValueError(f"key, value must have dtype {self.dtype}, but key.dtype = {key.dtype}, value.dtype = {key.dtype}")
+        if key.dtype != self.dtype:
+            key = key.to(self.dtype)
+        if value.dtype != self.dtype:
+            value = value.to(self.dtype)
         if self.current_length == self.cache_length and not self.just_updated:
             raise IndexError("Need to call 'update' before calling 'forward'")
         # Write new content into slot
         self.k[:, :, self.next_position, :] = key
         self.v[:, :, self.next_position, :] = value
-        self.current_length = max(self.cache_length, self.current_length + 1)
+        self.current_length = min(self.cache_length, self.current_length + 1)
         self.just_updated = False
         return self.k[:, :, :self.current_length, :], self.v[:, :, :self.current_length, :]
 
@@ -86,6 +91,7 @@ class AttnWeightsKVCache(KVCache):
             raise IndexError("Error in '_update': self.next_position needs to be set")
         if self.current_length < self.cache_length and self.next_position != self.current_length:
             raise IndexError(f"Error in '_update': next_position = {self.next_position}, current_length = {self.current_length}, must be equal as long as cache not full")
+        self.just_updated = True
 
     def _update(self, attn_weights: torch.Tensor):
         raise NotImplementedError()
@@ -95,6 +101,9 @@ class AttnWeightsKVCache(KVCache):
         Starts a generation loop by passing key and value tensors coming from
         a prefill with embeddings coming from the prompts. The length `T` must
         be smaller or equal to `cache_length`.
+
+        Note: If this method is called with `T == cache_length`, :meth:`update`
+        must be called before :meth:`forward`.
 
         Args:
             key: Prefill keys, `(batch_size, n_query_groups, T, head_size)`
@@ -108,11 +117,11 @@ class AttnWeightsKVCache(KVCache):
         shape = (self.batch_size, self.n_query_groups, init_length, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
-        if key.dtype != self.dtype or value.dtype != self.dtype:
-            raise ValueError(f"key, value must have dtype {self.dtype}, but key.dtype = {key.dtype}, value.dtype = {key.dtype}")
         # Initialize cache buffers
-        self.k[:, :, :init_length, :] = key
-        self.v[:, :, :init_length, :] = value
+        self.k[:, :, :init_length, :] = key.to(self.dtype)
+        self.v[:, :, :init_length, :] = value.to(self.dtype)
         self.current_length = init_length
         if init_length < self.cache_length:
             self.next_position = init_length
+        else:
+            self.next_position = None
