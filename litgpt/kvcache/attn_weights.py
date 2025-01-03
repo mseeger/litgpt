@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 
 from litgpt import Config
-from litgpt.kvcache import KVCache
+from litgpt.kvcache.base import KVCache
 
 
 class AttnWeightsKVCache(KVCache):
@@ -59,17 +59,17 @@ class AttnWeightsKVCache(KVCache):
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         if self.current_length == self.cache_length and not self.just_updated:
             raise IndexError("Need to call 'update' before calling 'forward'")
-        key = key.to(self.dtype)
-        value = value.to(self.dtype)
+        key = key.to(device=self.device, dtype=self.dtype)
+        value = value.to(device=self.device, dtype=self.dtype)
         # Write new content into slot
         # `next_position` is batched index, shape `(batch_size, n_query_groups)`
         index = self.next_position.unsqueeze(-1)
         # `index[i, j, 0] = next_position[i, j]`
-        self.token_pos.scatter_(2, index, self.next_token_pos)
+        self.token_pos.scatter_(-1, index, self.next_token_pos)
         index = index.unsqueeze(-1).expand(-1, -1, 1, self.head_size)
         # `index[i, j, 0, k] = next_position[i, j]`
-        self.k.scatter_(2, index, key.unsqueeze(2))
-        self.v.scatter_(2, index, value.unsqueeze(2))
+        self.k.scatter_(-2, index, key.unsqueeze(2))
+        self.v.scatter_(-2, index, value.unsqueeze(2))
         self.current_length = min(self.cache_length, self.current_length + 1)
         self.just_updated = False
         self.next_position = None  # Set by next :meth:`update` call
@@ -95,13 +95,18 @@ class AttnWeightsKVCache(KVCache):
                 raise ValueError("Need to pass attn_weights argument")
         if not isinstance(attn_weights, torch.Tensor):
             raise TypeError("attn_weights argument needs to be torch.Tensor")
+        if attn_weights.device != self.device:
+            raise ValueError(f"attn_weights.device = {attn_weights.device}, self.device = {self.device}. Must be the same")
         shape = (self.batch_size, self.n_head, self.current_length)
         if attn_weights.shape != shape:
             raise ValueError(f"Shape of attn_weights must be {shape}, but attn_weights.shape = {attn_weights.shape}")
         self._update(attn_weights)
         # Check post-conditions
-        if self.next_position is None:
-            raise IndexError("Error in '_update': self.next_position needs to be set")
+        if self.current_length < self.cache_length:
+            # Set `next_position`
+            self._set_next_position_constant(self.current_length)
+        elif self.next_position is None:
+            raise IndexError("Error in '_update': self.next_position must be set")
         self.just_updated = True
 
     def _update(self, attn_weights: torch.Tensor):
@@ -110,7 +115,8 @@ class AttnWeightsKVCache(KVCache):
         This method needs to set `next_position`, a batched index of shape
         `(batch_size, n_query_groups)`. If `current_length < cache_length`,
         this must be constant equal to `current_length` (see
-        :meth:`_set_next_position_constant`).
+        :meth:`_set_next_position_constant`). This assignment is done at the
+        end of :meth:`update`, so this method does not have to do it.
 
         Args:
             attn_weights: Attention weights for the multi-head attention
@@ -141,8 +147,8 @@ class AttnWeightsKVCache(KVCache):
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         # Initialize cache buffers
-        self.k[:, :, :init_length, :] = key.to(self.dtype)
-        self.v[:, :, :init_length, :] = value.to(self.dtype)
+        self.k[:, :, :init_length, :] = key.to(device=self.device, dtype=self.dtype)
+        self.v[:, :, :init_length, :] = value.to(device=self.device, dtype=self.dtype)
         self.current_length = init_length
         self.next_token_pos = init_length
         if init_length < self.cache_length:
@@ -154,3 +160,23 @@ class AttnWeightsKVCache(KVCache):
         self.next_position = torch.full(
             (1, 1), val, dtype=torch.int, device=self.device
         ).expand(self.batch_size, self.n_query_groups)
+
+    def _average_attn_weights(self, attn_weights: torch.Tensor) -> torch.Tensor:
+        """
+        `attn_weights` has shape `(batch_size, n_head, current_length)`, while
+        `v` has shape `(batch_size, n_query_groups, cache_length, head_size)`.
+        If `n_query_groups < n_head`, we average over the heads per query group.
+        Otherwise, we just return `attn_weights`.
+
+        Args:
+            attn_weights: Argument to :meth:`_update`
+
+        Returns:
+            See above, shape `(batch_size, n_query_groups, current_length)`
+        """
+        if self.n_query_groups == self.n_head:
+            return attn_weights
+        else:
+            return attn_weights.view(
+                self.batch_size, self.n_query_groups, -1, self.current_length
+            ).mean(dim=2)
