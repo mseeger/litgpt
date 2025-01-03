@@ -129,10 +129,15 @@ class AttnWeightsKVCache(KVCache):
         """
         Starts a generation loop by passing key and value tensors coming from
         a prefill with embeddings coming from the prompts. The length `T` must
-        be smaller or equal to `cache_length`.
+        be smaller than `cache_length`.
 
-        Note: If this method is called with `T == cache_length`, :meth:`update`
-        must be called before :meth:`forward`.
+        Note: The largest `T` this method can be called for is `cache_length - 1`.
+        This is because we cannot fill the cache and call :meth:`forward`
+        before calling :meth:`update`, since otherwise `next_position` is not
+        properly set. The underlying issue is that the prefill computation uses
+        the efficient "training" computation of multi-head attention, for which
+        we do not obtain the attention weights. But these are needed (for the
+        final token filling the cache) in :meth:`update`.
 
         Args:
             key: Prefill keys, `(batch_size, n_query_groups, T, head_size)`
@@ -141,8 +146,8 @@ class AttnWeightsKVCache(KVCache):
         if key.dim() != 4:
             raise ValueError("key must have 4 dimensions")
         init_length = key.shape[2]
-        if init_length > self.cache_length:
-            raise ValueError(f"key.shape[2] = {init_length}, must be at most {self.cache_length}")
+        if init_length >= self.cache_length:
+            raise ValueError(f"key.shape[2] = {init_length}, must be at most {self.cache_length - 1}")
         shape = (self.batch_size, self.n_query_groups, init_length, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
@@ -151,10 +156,9 @@ class AttnWeightsKVCache(KVCache):
         self.v[:, :, :init_length, :] = value.to(device=self.device, dtype=self.dtype)
         self.current_length = init_length
         self.next_token_pos = init_length
-        if init_length < self.cache_length:
-            self._set_next_position_constant(init_length)
-        else:
-            self.next_position = None  # Set by next :meth:`update` call
+        # The cache is not completely full, so that :meth:`forward` can be
+        # called without having to call :meth:`update` before
+        self._set_next_position_constant(init_length)
 
     def _set_next_position_constant(self, val: int):
         self.next_position = torch.full(
