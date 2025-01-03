@@ -104,12 +104,12 @@ class H2OOriginalKVCache(AttnWeightsKVCache):
     shapes remain the same, for compatibility with the parent class.
     """
     def __init__(
-            self,
-            config: Config,
-            batch_size: int,
-            cache_length: int,
-            device: Optional[torch.device] = None,
-            dtype: Optional[torch.dtype] = None,
+        self,
+        config: Config,
+        batch_size: int,
+        cache_length: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(config, batch_size, cache_length, device, dtype)
         shape = (self.n_query_groups, cache_length)
