@@ -42,11 +42,15 @@ class AttnWeightsKVCache(KVCache):
         # Initialized by :meth:`prefill`.
         self.next_position = None
         # Next token position :meth:`forward` is called for
-        self.next_token_pos = None
+        self._next_token_pos = None
         # Number of slots which are occupied. Grows until `cache_length`, then
         # stays there. Initialized by :meth:`prefill`.
         self.current_length = None
         self.just_updated = False
+
+    @property
+    def next_token_pos(self) -> Optional[int]:
+        return self._next_token_pos
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.next_position is None:
@@ -65,7 +69,7 @@ class AttnWeightsKVCache(KVCache):
         # `next_position` is batched index, shape `(batch_size, n_query_groups)`
         index = self.next_position.unsqueeze(-1)
         # `index[i, j, 0] = next_position[i, j]`
-        self.token_pos.scatter_(-1, index, self.next_token_pos)
+        self.token_pos.scatter_(-1, index, self._next_token_pos)
         index = index.unsqueeze(-1).expand(-1, -1, 1, self.head_size)
         # `index[i, j, 0, k] = next_position[i, j]`
         self.k.scatter_(-2, index, key.unsqueeze(2))
@@ -73,7 +77,7 @@ class AttnWeightsKVCache(KVCache):
         self.current_length = min(self.cache_length, self.current_length + 1)
         self.just_updated = False
         self.next_position = None  # Set by next :meth:`update` call
-        self.next_token_pos += 1
+        self._next_token_pos += 1
         return self.k[:, :, :self.current_length, :], self.v[:, :, :self.current_length, :]
 
     def update(self, *args, **kwargs):
@@ -155,7 +159,7 @@ class AttnWeightsKVCache(KVCache):
         self.k[:, :, :init_length, :] = key.to(device=self.device, dtype=self.dtype)
         self.v[:, :, :init_length, :] = value.to(device=self.device, dtype=self.dtype)
         self.current_length = init_length
-        self.next_token_pos = init_length
+        self._next_token_pos = init_length
         # The cache is not completely full, so that :meth:`forward` can be
         # called without having to call :meth:`update` before
         self._set_next_position_constant(init_length)

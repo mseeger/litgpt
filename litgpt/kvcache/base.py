@@ -37,6 +37,15 @@ class KVCache(torch.nn.Module):
         self.device = device
         self.dtype = dtype
 
+    @property
+    def next_token_pos(self) -> Optional[int]:
+        """
+        Returns:
+            Position of next token to be generated, or `None` if cache has not
+            been initialized yet (call of :meth:`prefill`).
+        """
+        raise NotImplementedError()
+
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Accepts key and value tensors for new token position. These are written
@@ -116,6 +125,14 @@ class DenseKVCache(KVCache):
         self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.next_position = None
+
+    @property
+    def max_sequence_length(self) -> int:
+        return self.cache_length
+
+    @property
+    def next_token_pos(self) -> Optional[int]:
+        return self.next_position
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.next_position is None:
