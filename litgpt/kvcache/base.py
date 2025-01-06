@@ -1,8 +1,20 @@
 from typing import Tuple, Optional
+from dataclasses import dataclass
 
 import torch
 
 from litgpt.config import Config
+
+
+@dataclass(frozen=True)
+class KVCacheParams:
+    batch_size: int
+    n_query_groups: int
+    head_size: int
+    n_head: int
+    device: Optional[torch.device]
+    dtype: Optional[torch.dtype]
+    max_prefill_length: int
 
 
 class KVCache(torch.nn.Module):
@@ -41,8 +53,8 @@ class KVCache(torch.nn.Module):
     def next_token_pos(self) -> Optional[int]:
         """
         Returns:
-            Position of next token to be generated, or `None` if cache has not
-            been initialized yet (call of :meth:`prefill`).
+            Input position for next token to be generated, or `None` if cache
+            has not been initialized yet (call of :meth:`prefill`).
         """
         raise NotImplementedError()
 
@@ -77,17 +89,37 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
+    @property
+    def max_prefill_length(self) -> int:
+        """
+        Returns:
+            Maximum sequence length for `key`, `value` tensors passed to
+            :meth:`prefill`.
+        """
+        raise NotImplementedError()
+
     def prefill(self, key: torch.Tensor, value: torch.Tensor):
         """
         Starts a generation loop by passing key and value tensors coming from
         a prefill with embeddings coming from the prompts. The length `T` must
-        be smaller or equal to `cache_length`.
+        be smaller or equal to `max_prefill_length`.
 
         Args:
             key: Prefill keys, `(batch_size, n_query_groups, T, head_size)`
             value: Prefill values, `(batch_size, n_query_groups, T, head_size)`
         """
         raise NotImplementedError()
+
+    def get_params(self) -> KVCacheParams:
+        return KVCacheParams(
+            batch_size=self.batch_size,
+            n_query_groups=self.n_query_groups,
+            head_size=self.n_head,
+            n_head=self.n_head,
+            device=self.device,
+            dtype=self.dtype,
+            max_prefill_length=self.max_prefill_length,
+        )
 
 
 class DenseKVCache(KVCache):
@@ -127,12 +159,12 @@ class DenseKVCache(KVCache):
         self.next_position = None
 
     @property
-    def max_sequence_length(self) -> int:
-        return self.cache_length
-
-    @property
     def next_token_pos(self) -> Optional[int]:
         return self.next_position
+
+    @property
+    def max_prefill_length(self) -> int:
+        return self.cache_length
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.next_position is None:

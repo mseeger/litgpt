@@ -77,11 +77,32 @@ def next_token(
     model: GPT,
     input_pos: torch.Tensor,
     x: torch.Tensor,
-    input_pos_maxp1: Optional[torch.Tensor] = None,
+    token_value: Optional[torch.Tensor] = None,
     **sample_kwargs: Dict[str, Any],
 ) -> torch.Tensor:
-    logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1)
-    _next = sample(logits, **sample_kwargs).to(dtype=torch.int64)
+    """
+    If `token_value` is given, we compute logits, but do not use them,
+    returning `token_value` instead. This is used in order to populate the
+    KV cache in cases where the prompt is longer than the cache length.
+
+    Args:
+        model: Model for computing logits used for sampling
+        input_pos: Position of input token. The token to be generated has
+            position `input_pos + 1`
+        x: Input token
+        token_value: See above. Defaults to `None`
+        **sample_kwargs: Parameters for :func:`sample`
+
+    Returns:
+        Scalar array with new token (or `token_value`, if given)
+
+    """
+    assert input_pos.dim() == 1 and input_pos.shape[0] == 1, "input_pos must be scalar int tensor"
+    logits = model(x, input_pos)
+    if token_value is None:
+        _next = sample(logits, **sample_kwargs).to(dtype=torch.int64)
+    else:
+        _next = token_value
     return _next
 
 
@@ -90,6 +111,7 @@ def batched_sample(logits: list[torch.Tensor], kwargs: list[dict]) -> torch.Tens
     return torch.stack([sample(l, **sample_args).to(dtype=torch.int64) for sample_args, l in zip(kwargs, logits)], dim=0)
 
 
+# TODO!
 def batched_next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, kwargs: Union[dict, list[dict]]) -> torch.Tensor:
     # Where:
     # input_pos is a 1d tensor of shape [seq_length...]
@@ -150,8 +172,6 @@ def generate_fn(
         include_eos: Whether to output the stop tokens if generation stops early.
     """
 
-
-
     prompt_size = prompt.size(0)
     device = prompt.device
 
@@ -165,64 +185,82 @@ def generate_fn(
 
     stop_progress = [0] * len(stop_tokens)
     yielded_idx = 0
+    sample_kwargs = dict(
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+    )
 
-    # Generate output tokens.
-    # The first token generated is the prefill token.
-    # The input_pos for this token is the width of the entire prompt.
-    # For subsequent iterations, it's the index in the context for the token that we're generating.
+    # Prefill phase
+    kv_cache_params = model.get_kv_cache_params()
+    max_prefill_length = prompt_size if kv_cache_params is None else kv_cache_params.max_prefill_length
+    # A KV cache has a maximum prefill length. If the prompt is longer than
+    # that, we run the rest of the prompt prefill token by token in the loop
+    # below
+    token_pos = min(prompt_size, max_prefill_length)
+    all_logits = model(prompt[:token_pos], for_prefill=True)
+    input_pos = torch.tensor(token_pos, device=device)
     tokens = []
-    token = prompt
-    prefill_token = True
-    input_pos = torch.arange(0, prompt_size, device=device, dtype=torch.int64)
-    input_pos_maxp1 = torch.tensor(prompt_size, device=device)
-    for current_idx in range(max_returned_tokens - prompt_size):
-
-        # Generate the token
-        token = next_token(
-            model,
-            input_pos,
-            token.view(1, -1),
-            input_pos_maxp1=input_pos_maxp1,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )
+    if token_pos >= prompt_size:
+        # Generate first token after prompt
+        token = sample(all_logits, **sample_kwargs)
         tokens.append(token)
-        int_token = token.item()
+    else:
+        # Process next token from prompt
+        token = prompt[token_pos:(token_pos + 1)]
+    token_pos += 1
+    all_logits = None
 
-        # Check for stop sequences
-        # For each stop sequence, we keep a running total of how many are matched in stop_progress.
-        # If the current token matches the next token in the stop sequence, we increment the
-        # running total and hold off on yielding the token.
-        for i, seq in enumerate(stop_tokens):
-            if int_token == seq[stop_progress[i]]:
-                stop_progress[i] += 1
-                if stop_progress[i] == len(seq):
-                    if include_eos:
-                        yield from tokens[yielded_idx:]
-                    return
-            else:
-                stop_progress[i] = 0
-
-        # Yield tokens that are not part of a stop sequence in progress.
-        # If there are no stop sequences, then that's all of them.
-        if stop_tokens:
-            safe_idx = len(tokens) - max(stop_progress)
+    # Generation loop
+    # As long as token_pos < prompt_size, we use tokens from prompt. This
+    # happens if the KV cache size is smaller than the prompt.
+    for current_idx in range(max_returned_tokens - token_pos):
+        # Generate the token
+        if token_pos >= prompt_size:
+            token_value = None
         else:
-            safe_idx = current_idx + 1 # include the token just generated
+            token_value = prompt[token_pos:(token_pos + 1)]
+        token = next_token(
+            model=model,
+            input_pos=input_pos,
+            x=token.view(1, -1),
+            token_value=token_value,
+            **sample_kwargs,
+        )
+        if token_value is None:
+            # Token has just been generated
+            tokens.append(token)
+            int_token = token.item()
 
-        if yielded_idx < safe_idx:
-            y_tokens = tokens[yielded_idx : safe_idx]
-            yield from y_tokens
-            yielded_idx = safe_idx
+            # Check for stop sequences
+            # For each stop sequence, we keep a running total of how many are matched in stop_progress.
+            # If the current token matches the next token in the stop sequence, we increment the
+            # running total and hold off on yielding the token.
+            for i, seq in enumerate(stop_tokens):
+                if int_token == seq[stop_progress[i]]:
+                    stop_progress[i] += 1
+                    if stop_progress[i] == len(seq):
+                        if include_eos:
+                            yield from tokens[yielded_idx:]
+                        return
+                else:
+                    stop_progress[i] = 0
+
+            # Yield tokens that are not part of a stop sequence in progress.
+            # If there are no stop sequences, then that's all of them.
+            if stop_tokens:
+                safe_idx = len(tokens) - max(stop_progress)
+            else:
+                safe_idx = current_idx + 1 # include the token just generated
+
+            if yielded_idx < safe_idx:
+                y_tokens = tokens[yielded_idx : safe_idx]
+                yield from y_tokens
+                yielded_idx = safe_idx
 
         # Update input_pos for the next iteration.
-        if prefill_token:
-            prefill_token = False
-            input_pos = torch.tensor([prompt_size], device=device, dtype=torch.int64)
-        else:
-            input_pos.add_(1)
-        input_pos_maxp1.add_(1)
+        input_pos.add_(1)
+        token_pos += 1
 
     # Yield any remaining tokens
     if yielded_idx < len(tokens):
@@ -430,6 +468,9 @@ def main(
     """Default generation option.
 
     Generates text samples based on a pre-trained model and tokenizer.
+
+    Note that this is using default dense KV caches, which may require a lot
+    of memory.
 
     Args:
         checkpoint_dir: The checkpoint directory to load.

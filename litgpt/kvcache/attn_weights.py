@@ -129,6 +129,10 @@ class AttnWeightsKVCache(KVCache):
         """
         raise NotImplementedError()
 
+    @property
+    def max_prefill_length(self) -> int:
+        return self.cache_length - 1
+
     def prefill(self, key: torch.Tensor, value: torch.Tensor):
         """
         Starts a generation loop by passing key and value tensors coming from
@@ -150,8 +154,8 @@ class AttnWeightsKVCache(KVCache):
         if key.dim() != 4:
             raise ValueError("key must have 4 dimensions")
         init_length = key.shape[2]
-        if init_length >= self.cache_length:
-            raise ValueError(f"key.shape[2] = {init_length}, must be at most {self.cache_length - 1}")
+        if init_length > self.max_prefill_length:
+            raise ValueError(f"key.shape[2] = {init_length}, must be at most {self.max_prefill_length}")
         shape = (self.batch_size, self.n_query_groups, init_length, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")

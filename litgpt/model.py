@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
-from litgpt.kvcache import KVCache, DenseKVCache
+from litgpt.kvcache import KVCache, DenseKVCache, KVCacheParams
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -43,8 +43,9 @@ class GPT(nn.Module):
         if kv_cache is not None:
             if len(kv_cache) != config.n_layer:
                 raise ValueError(f"kv_cache length {len(kv_cache)} != {config.n_layer} = config.n_layer")
+            max_prefill_length = kv_cache[0].max_prefill_length
             for kvc in kv_cache:
-                self._check_kv_cache(config, kvc)
+                self._check_kv_cache(config, kvc, max_prefill_length)
             self._default_kv_cache = False
         else:
             kv_cache = [None] * config.n_layer
@@ -93,11 +94,11 @@ class GPT(nn.Module):
         elif value != self.cos.size(0):
             self.cos, self.sin = self.rope_cache(device=self.cos.device)
         # KV caches
-        for l_idx, block in enumerate(self.transformer.h):
+        for l_ix, block in enumerate(self.transformer.h):
             attn = block.attn
             kv_cache = attn.kv_cache
             if kv_cache is not None and isinstance(kv_cache, DenseKVCache) and kv_cache.cache_length < value:
-                print(f"KV cache for layer {l_idx} too small: Reallocating")
+                print(f"KV cache for layer {l_ix} too small: Reallocating")
                 attn.create_default_kv_cache(
                     batch_size=kv_cache.batch_size,
                     device=kv_cache.device,
@@ -115,14 +116,21 @@ class GPT(nn.Module):
         self.cos, self.sin = self.rope_cache(device=self.cos.device)
 
     @staticmethod
-    def _check_kv_cache(config: Config, kv_cache: KVCache):
-        if config.n_query_groups != kv_cache.n_query_groups:
-            raise ValueError(f"config and kv_cache not compatible: config.n_query_groups = {config.n_query_groups} != {kv_cache.n_query_groups} = kv_cache.n_query_groups")
-        if config.n_head != kv_cache.n_head:
-            raise ValueError(f"config and kv_cache not compatible: config.n_head = {config.n_head} != {kv_cache.n_head} = kv_cache.n_head")
+    def _check_kv_cache(
+        config: Config,
+        kv_cache: KVCache,
+        max_prefill_length: Optional[int] = None,
+    ):
+        params = kv_cache.get_params()
+        if config.n_query_groups != params.n_query_groups:
+            raise ValueError(f"config and kv_cache not compatible: config.n_query_groups = {config.n_query_groups} != {params.n_query_groups} = kv_cache.n_query_groups")
+        if config.n_head != params.n_head:
+            raise ValueError(f"config and kv_cache not compatible: config.n_head = {config.n_head} != {params.n_head} = kv_cache.n_head")
         head_size = config.n_embd // config.n_head
-        if head_size != kv_cache.head_size:
-            raise ValueError(f"config and kv_cache not compatible: config.head_size = {head_size} != {kv_cache.head_size} = kv_cache.head_size")
+        if head_size != params.head_size:
+            raise ValueError(f"config and kv_cache not compatible: config.head_size = {head_size} != {params.head_size} = kv_cache.head_size")
+        if max_prefill_length is not None and params.max_prefill_length != max_prefill_length:
+            raise ValueError("The KV caches for all layers must have the same max_prefill_length")
 
     def _init_weights(self, module: nn.Module) -> None:
         """Meant to be used with `gpt.apply(gpt._init_weights)`."""
@@ -176,8 +184,8 @@ class GPT(nn.Module):
                 raise ValueError(f"If input_pos is given, sequence length must be 1, but is {T}")
             for l_ix, block in enumerate(self.transformer.h):
                 kv_cache = block.attn.kv_cache
-                if kv_cache is None:
-                    raise ValueError(f"KV cache for layer {l_ix} is missing. You need to start with pre-filling (for_prefill=True)")
+                if kv_cache is None or kv_cache.next_token_pos is None:
+                    raise ValueError(f"KV cache for layer {l_ix} is missing or not initialized. You need to start with pre-filling (for_prefill=True)")
                 if kv_cache.next_token_pos != input_pos:
                     raise ValueError(f"KV cache for layer {l_ix}: input_pos = {input_pos} != {self.kv_cache.next_token_pos} = kv_cache.next_token_pos")
             for_prefill = False
@@ -202,24 +210,23 @@ class GPT(nn.Module):
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd ** 0.5, dtype=x.dtype)
 
-        if for_prefill:
-            # Create default KV caches if not present
-            batch_size = x.shape[0]
-            device = x.device
-            dtype = x.dtype
-            for block in self.transformer.h:
+        for l_ix, block in enumerate(self.transformer.h):
+            if for_prefill:
+                # Create default KV caches if not present
                 attn = block.attn
                 if attn.kv_cache is None:
+                    # Same device and dtype as input `x`
+                    print(f"Allocating KV cache for layer {l_ix}")
                     attn.create_default_kv_cache(
-                        batch_size=batch_size,
-                        device=device,
-                        dtype=dtype,
+                        batch_size=x.shape[0],
+                        device=x.device,
+                        dtype=x.dtype,
                         max_sequence_length=self.max_seq_length,
                     )
-            self.mask_cache = build_mask_cache(self.max_seq_length, device=device)
-
-        for block in self.transformer.h:
+                if l_ix == 0:
+                    self.mask_cache = build_mask_cache(self.max_seq_length, device=x.device)
             x = block(x, cos, sin, mask, input_pos, for_prefill)
+
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -283,6 +290,10 @@ class GPT(nn.Module):
         if self._default_kv_cache:
             for block in self.transformer.h:
                 block.attn.kv_cache = None
+
+    def get_kv_cache_params(self) -> Optional[KVCacheParams]:
+        kv_cache = self.transformer[0].attn.kv_cache
+        return None if kv_cache is None else kv_cache.get_params()
 
 
 class Block(nn.Module):
@@ -348,7 +359,7 @@ class Block(nn.Module):
             sin=sin,
             mask=mask,
             input_pos=input_pos,
-            for_prefill=for_prefill
+            for_prefill=for_prefill,
         )
         attention_output = self.post_attention_norm(attention_output)
 
@@ -380,7 +391,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(
             config.head_size * config.n_head, config.n_embd, bias=config.bias
         )
-        # disabled by default
+        # KV cache (optional)
         self.kv_cache = kv_cache
         self.apply_sliding_window_attention = (
             config.sliding_window_size is not None and
@@ -423,8 +434,8 @@ class CausalSelfAttention(nn.Module):
         rope_n_elem = self.config.rope_n_elem
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
         if input_pos is not None:
-            if self.kv_cache is None:
-                raise ValueError("If input_pos is given, KV cache must exist")
+            if self.kv_cache is None or self.kv_cache.next_token_pos is None:
+                raise ValueError("If input_pos is given, KV cache must exist and be initialized (call with for_prefill=True)")
             if self.kv_cache.next_token_pos != input_pos:
                 raise ValueError(f"input_pos = {input_pos} != {self.kv_cache.next_token_pos} = kv_cache.next_token_pos")
             if T != 1:
@@ -480,6 +491,7 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
             v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
 
+        # TODO! This does not work if `input_pos` is given!
         if self.apply_sliding_window_attention:
             """
                   Global Window              Sliding window             Sliding window
