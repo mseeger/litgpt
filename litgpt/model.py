@@ -16,7 +16,12 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
-from litgpt.kvcache import KVCache, DenseKVCache, KVCacheParams
+from litgpt.kvcache import (
+    KVCache,
+    DenseKVCache,
+    KVCacheParams,
+    AttnWeightsKVCache,
+)
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -228,10 +233,8 @@ class GPT(nn.Module):
             x = block(x, cos, sin, mask, input_pos, for_prefill)
 
         x = self.transformer.ln_f(x)
-        clamp_head = (
-            partial(do_softcapping, thresh=self.config.final_logit_softcapping)
-            if self.config.final_logit_softcapping is not None
-            else nn.Identity()
+        clamp_head = partial(
+            do_softcapping, thresh=self.config.final_logit_softcapping
         )
         if lm_head_chunk_size > 0:
             # chunk the lm head logits to reduce the peak memory used by autograd
@@ -488,8 +491,8 @@ class CausalSelfAttention(nn.Module):
         # Multi-query: this step can be skipped since there is only 1 head, allowing us to use broadcasting.
         if n_query_groups != n_head and (input_pos is None or n_query_groups != 1):
             q_per_kv = n_head // n_query_groups
-            k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
-            v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
+            k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, *, hs)
+            v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, *, hs)
 
         # TODO! This does not work if `input_pos` is given!
         if self.apply_sliding_window_attention:
@@ -514,7 +517,13 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        y = self.scaled_dot_product_attention(q, k, v, mask)
+        return_scores = input_pos is not None and isinstance(self.kv_cache, AttnWeightsKVCache)
+        y, scores = self.scaled_dot_product_attention(q, k, v, mask, return_scores)
+
+        if return_scores:
+            # Pass attention weights to KV cache
+            scores = scores.squeeze(-2)
+            self.kv_cache.update(attn_weights=scores)
 
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, head_size * n_head)
@@ -523,25 +532,39 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)  # (B, T, C)
 
     def scaled_dot_product_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        return_scores: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
 
         # with softcapping we cannot use SDPA
-        if self.config.attention_logit_softcapping is not None:
-            scores = q @ k.mT * scale
-            scores = do_softcapping(scores, self.config.attention_logit_softcapping)
-            if mask is None:
-                mask = torch.ones(q.size(2), q.size(2), dtype=q.dtype, device=q.device).triu(diagonal=1)
-                mask.masked_fill_(mask.bool(), torch.finfo(q.dtype).min)
-            scores = scores + mask
-            scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
-            y = scores @ v
+        if return_scores or self.config.attention_logit_softcapping is not None:
+            y, scores = scaled_dot_product_attention(
+                query=q,
+                key=k,
+                value=v,
+                scale=scale,
+                mask=mask,
+                attention_logit_softcapping=self.config.attention_logit_softcapping,
+            )
+            if not return_scores:
+                scores = None
         else:
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=scale,
+                is_causal=mask is None,
             )
-        return y.transpose(1, 2)
+            scores = None
+        return y.transpose(1, 2), scores
 
     def create_default_kv_cache(
         self,
@@ -640,6 +663,26 @@ class LLaMAMoE(nn.Module):
             token_idx, expert_idx = torch.where(mask)
             y[token_idx] += probs[token_idx, expert_idx, None] * expert(x[token_idx])
         return y.view(B, T, C)
+
+
+def scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    mask: Optional[torch.Tensor] = None,
+    attention_logit_softcapping: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    dtype = query.dtype
+    scores = query @ key.mT * scale
+    scores = do_softcapping(scores, attention_logit_softcapping)
+    if mask is None:
+        T = query.size(2)
+        mask = torch.ones(T, T, dtype=dtype, device=query.device).triu(diagonal=1)
+        mask.masked_fill_(mask.bool(), torch.finfo(query.dtype).min)
+    scores = scores + mask
+    scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)
+    return scores @ value, scores
 
 
 def build_rope_cache(
@@ -753,8 +796,11 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return roped.to(dtype=x.dtype)
 
 
-def do_softcapping(x: torch.Tensor, thresh: float) -> torch.Tensor:
-    return torch.tanh(x / thresh) * thresh
+def do_softcapping(x: torch.Tensor, thresh: Optional[float]) -> torch.Tensor:
+    if thresh is not None:
+        return torch.tanh(x / thresh) * thresh
+    else:
+        return x
 
 
 def build_mask_cache(max_seq_length: int, device: Optional[torch.device] = None) -> torch.Tensor:
