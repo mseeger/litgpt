@@ -73,6 +73,7 @@ def sample(
     return torch.argmax(logits, dim=-1, keepdim=True)
 
 
+# TODO: Remove
 def next_token(
     model: GPT,
     input_pos: torch.Tensor,
@@ -106,12 +107,13 @@ def next_token(
     return _next
 
 
+# TODO: Remove
 def batched_sample(logits: list[torch.Tensor], kwargs: list[dict]) -> torch.Tensor:
     assert len(logits) == len(kwargs), "logits and kwargs must have the same length."
     return torch.stack([sample(l, **sample_args).to(dtype=torch.int64) for sample_args, l in zip(kwargs, logits)], dim=0)
 
 
-# TODO!
+# TODO: Remove once test is ported/removed
 def batched_next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, kwargs: Union[dict, list[dict]]) -> torch.Tensor:
     # Where:
     # input_pos is a 1d tensor of shape [seq_length...]
@@ -144,6 +146,7 @@ def batched_next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, kwa
     return batched_sample(logits_list, kwargs=_kwargs)
 
 
+# TODO: Remove once compared against generate_batch_fn
 @torch.inference_mode()
 def generate_fn(
     model: GPT,
@@ -353,7 +356,7 @@ def batched_generate_fn(
     prompts: List[torch.Tensor],
     max_returned_tokens: int,
     *,
-    sample_args: Union[list[dict], dict],
+    sample_args: Union[List[dict], dict],
     stop_tokens: Tuple[List[int], ...] = (),
     include_prompt: bool,
     include_eos: bool,
@@ -375,7 +378,8 @@ def batched_generate_fn(
         A list of tokens for each prompt in the batch, or None if a stop
         sequence has already been encountered for that index in the batch,
         or if the prompt is still being processed for that index (only if
-        include_prompt is False).
+        include_prompt is False). The number of tokens yielded can depend
+        on the batch index, can be more than one.
     """
     batch_size = len(prompts)
     assert batch_size > 0, "No prompts are given"
@@ -407,7 +411,12 @@ def batched_generate_fn(
     # maximum prefill length of the KV cache
     token_pos = min(prompt_size)
     kv_cache_params = model.get_kv_cache_params()
-    max_prefill_length = token_pos if kv_cache_params is None else kv_cache_params.max_prefill_length
+    # TODO: KV cache batch size should be changeable with prefill call
+    if kv_cache_params is not None:
+        max_prefill_length = kv_cache_params.max_prefill_length
+        assert kv_cache_params.batch_size == batch_size, f"batch_size = {batch_size} != {kv_cache_params.batch_size} = kv_cache.batch_size"
+    else:
+        max_prefill_length = token_pos
     token_pos = min([token_pos, max_prefill_length])
     inputs = torch.tensor(
         [prompt[:token_pos] for prompt in prompts],
@@ -504,7 +513,7 @@ def batched_generate_fn(
 @torch.inference_mode()
 def generate(
     model: GPT,
-    prompt: torch.Tensor,
+    prompts: List[torch.Tensor],
     max_returned_tokens: int,
     *,
     temperature: float = 1.0,
@@ -512,14 +521,15 @@ def generate(
     top_p: float = 1.0,
     eos_id: Optional[int] = None,
     include_prompt: bool = True,
-) -> torch.Tensor:
+    include_eos: bool = True,
+) -> List[torch.Tensor]:
     """
-    Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
-    The implementation of this function is modified from A. Karpathy's nanoGPT.
+    Takes a list of prompts as input (1D tensors, can be of different lengths)
+    and generates tokens as specified.
 
     Args:
         model: The model to use.
-        prompt: Tensor of shape (T) with indices of the prompt sequence.
+        prompts: List of batch_size 1D tensors, each being a prompt sequence
         max_returned_tokens: The maximum number of tokens to return (given plus generated).
         temperature: Scales the predicted logits by 1 / temperature.
         top_k: If specified, only sample among the tokens with the k highest probabilities.
@@ -538,22 +548,29 @@ def generate(
             For more details, see https://arxiv.org/abs/1904.09751
             or https://huyenchip.com/2024/01/16/sampling.html#top_p
         eos_id: If specified, stop generating any more token once the <eos> token is triggered.
-        include_prompt: If true (default) prepends the prompt (after applying the prompt style) to the output.
+        include_prompt: If true (default) prepends the prompt (after applying
+            the prompt style) to the output.
+        include_eos: If true (default), include <eos> token at the end of
+            sequences. Otherwise, this token is stipped off.
     """
 
-    token_list = list(generate_fn(
-        include_prompt=include_prompt,
-        include_eos=True,
+    token_list = [[] for _ in range(len(prompts))]
+    for part in batched_generate_fn(
         model=model,
-        prompt=prompt,
+        prompts=prompts,
         max_returned_tokens=max_returned_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        stop_tokens=(([eos_id],) if eos_id is not None else ())
-    ))
-
-    return torch.cat(token_list) if not len(token_list) == 0 else torch.Tensor()
+        sample_args=dict(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        ),
+        stop_tokens=([eos_id],) if eos_id is not None else (),
+        include_prompt = include_prompt,
+        include_eos = include_eos,
+    ):
+        for tl, p in zip(token_list, part):
+            tl.append(p)
+    return [torch.cat(parts) for parts in token_list]
 
 
 @torch.inference_mode()
@@ -650,8 +667,6 @@ def main(
     with fabric.init_tensor():
         # set the max_seq_length to limit the memory usage to what we need
         model.max_seq_length = max_returned_tokens
-        # enable the kv cache
-        model.set_kv_cache(batch_size=1)
     model.eval()
 
     if compile:
@@ -670,7 +685,15 @@ def main(
     L.seed_everything(1234)
     for i in range(num_samples):
         t0 = time.perf_counter()
-        y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, top_p=top_p, eos_id=tokenizer.eos_id)
+        y = generate(
+            model=model,
+            prompts=[encoded],
+            max_returned_tokens=max_returned_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            eos_id=tokenizer.eos_id,
+        )[0]
         t = time.perf_counter() - t0
         for block in model.transformer.h:
             block.attn.kv_cache.reset_parameters()
