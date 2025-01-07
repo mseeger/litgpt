@@ -98,7 +98,7 @@ def next_token(
 
     """
     assert input_pos.dim() == 1 and input_pos.shape[0] == 1, "input_pos must be scalar int tensor"
-    logits = model(x, input_pos)
+    logits = model(x, input_pos=input_pos[0])
     if token_value is None:
         _next = sample(logits, **sample_kwargs).to(dtype=torch.int64)
     else:
@@ -267,25 +267,69 @@ def generate_fn(
         yield from tokens[yielded_idx:]
 
 
-# TODO: Make include_eos work.
-# TODO: Rewrite unbatched generate_fn to use batched_generate_fn.
+class BatchSampler:
+    """
+    Performs token sampling given logits in the batch case, in the presence
+    of prompts of different length.
+
+    """
+    def __init__(
+        self,
+        prompts: List[torch.Tensor],
+        next_token_pos: int,
+        sample_kwargs: List[Dict[str, Any]]
+    ):
+        self.prompts = prompts
+        self.next_token_pos = next_token_pos
+        self.sample_kwargs = sample_kwargs
+        self.batch_size = len(prompts)
+        assert len(sample_kwargs) == self.batch_size
+        self.prompt_length = [p.shape[0] for p in prompts]
+        self.sampling_done = [False] * self.batch_size
+
+    def __call__(
+        self,
+        logits: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[bool]]:
+        """
+        Given `logits`, samples tokens for each batch dimension. Tokens are
+        taken from prompts as long as they have not been completely processed.
+        The mask `mask` contains `True` for batch dimensions where a token is
+        sampled, `False` if the token is taken from the prompt or sampling is
+        done for this dimension.
+
+        Args:
+            logits: Logits of shape `(batch_size, n_vocab)`
+
+        Returns:
+            `(sample, mask)`, where shape of `sample` is `(batch_size, 1)`
+
+        """
+        # HIER!!
+
+    def stop_sampling(self, dims: List[int]):
+        for dim in dims:
+            self.sampling_done[dim] = True
+
+
 @torch.inference_mode()
 def batched_generate_fn(
     model: GPT,
-    prompts: torch.Tensor,
+    prompts: List[torch.Tensor],
     max_returned_tokens: int,
     *,
     sample_args: Union[list[dict], dict],
     stop_tokens: Tuple[List[int], ...] = (),
     include_prompt: bool,
     include_eos: bool,
-) -> Iterator[list[Union[torch.Tensor, None]]]:
+) -> Iterator[List[Optional[torch.Tensor]]]:
     """
-    Generates tokens for a batch of prompts.
+    Generates tokens for a list of prompts, which need not have the same
+    length.
 
     Args:
         model: The model to use.
-        prompts: A 2D tensor of shape [batch_size, prompt_length].
+        prompts: A list of size batch_size, containing 1D tensors.
         max_returned_tokens: The maximum number of tokens to return, including the prompt tokens.
         sample_args: The dictionary of kwargs to pass to sample() for each each token for each index in the batch.
         stop_tokens: A tuple of stop sequences. If any of the sequences are generated, the generation stops early before max_returned_tokens.
@@ -293,26 +337,57 @@ def batched_generate_fn(
         include_eos: Whether to output the stop tokens if generation stops early.
 
     Yields:
-        A list of tokens for each prompt in the batch, or None if a stop sequence has already been encountered for that index in the batch.
+        A list of tokens for each prompt in the batch, or None if a stop
+        sequence has already been encountered for that index in the batch,
+        or if the prompt is still being processed for that index (only if
+        include_prompt is False).
     """
-
-    if prompts.ndim == 1:
-        prompts = prompts.unsqueeze(0)
-    assert prompts.ndim == 2, "Prompts must be a 2D tensor."
-
-    batch_size = prompts.size(0)
-    max_prompt_size = prompts.size(1)
-    device = prompts.device
+    batch_size = len(prompts)
+    assert batch_size > 0, "No prompts are given"
+    prompt_size = []
+    device = prompts[0].device
+    prompt_dtype = prompts[0].dtype
+    for prompt in prompts:
+        sz = prompt.shape[0]
+        assert prompt.dim() == 1 and sz > 0, "Each prompts must be non-empty 1D tensor"
+        assert prompt.device == device and prompt.dtype == prompt_dtype, "Prompts must have the same device, dtype"
+        prompt_size.append(sz)
+    max_prompt_size = max(prompt_size)
 
     if isinstance(sample_args, dict):
         sample_args = [sample_args] * len(prompts)
     else:
         assert len(sample_args) == batch_size, "sample_args must have the length as the batch size."
 
-    # TODO: This check (and the one in generate_fn) is not sufficient. We do the proper checks in LLM.generate().
     assert max_returned_tokens > max_prompt_size, f"Not enough space for {max_prompt_size} prompt tokens in a context length of {max_returned_tokens}."
     if model.max_seq_length < max_returned_tokens - 1:
         raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
+
+    # Prefill phase
+    token_pos = min(prompt_size)
+    kv_cache_params = model.get_kv_cache_params()
+    max_prefill_length = token_pos if kv_cache_params is None else kv_cache_params.max_prefill_length
+    token_pos = min([token_pos, max_prefill_length])
+    inputs = torch.tensor(
+        [prompt[:token_pos] for prompt in prompts],
+        dtype=prompt_dtype,
+        device=device
+    )
+    if include_prompt:
+        # Initial slice of prompts of equal length
+        yield inputs
+    all_logits = model(inputs, for_prefill=True)
+    input_pos = torch.tensor(token_pos, device=device)
+    tokens = []
+    if token_pos >= prompt_size:
+        # Generate first token after prompt
+        token = sample(all_logits, **sample_kwargs)
+        tokens.append(token)
+    else:
+        # Process next token from prompt
+        token = prompt[token_pos:(token_pos + 1)]
+    token_pos += 1
+    all_logits = None
 
     # Yield the prompts if include_prompt is True
     if include_prompt:

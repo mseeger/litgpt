@@ -295,7 +295,7 @@ class GPT(nn.Module):
                 block.attn.kv_cache = None
 
     def get_kv_cache_params(self) -> Optional[KVCacheParams]:
-        kv_cache = self.transformer[0].attn.kv_cache
+        kv_cache = self.transformer.h[0].attn.kv_cache
         return None if kv_cache is None else kv_cache.get_params()
 
 
