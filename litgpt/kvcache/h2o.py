@@ -49,7 +49,7 @@ class H2OKVCache(AttnWeightsKVCache):
         if self.next_position is not None:
             # Reset score values for slots where the new token will be written
             index = self.next_position.unsqueeze(-1)
-            self.scores.scatter_(-1, index, 0.0)
+            self.scores[:self.eff_batch_size, ...].scatter_(-1, index, 0.0)
         return super().forward(key, value)
 
     def prefill(self, key: torch.Tensor, value: torch.Tensor):
@@ -66,22 +66,22 @@ class H2OKVCache(AttnWeightsKVCache):
         # Scores are computed in `torch.float`. Also, deal with
         # `n_query_groups < n_head` by averaging
         attn_weights = self._average_attn_weights(attn_weights.to(torch.float))
-        self.scores[:, :, :self.current_length] += attn_weights
+        self.scores[:self.eff_batch_size, :, :self.current_length] += attn_weights
         if self.current_length == self.cache_length:
             # Set `next_position` to score minimizers
-            if not self.normalize_scores:
-                scores = self.scores
-            else:
+            scores = self.scores[:self.eff_batch_size, ...]
+            if self.normalize_scores:
                 # Normalize cumulative scores
+                token_pos = self.token_pos[:self.eff_batch_size, ...]
                 other = torch.full(
                     (1, 1, 1),
                     self.prefill_length - 1,
                     dtype=self.token_pos.dtype,
                     device=self.device
-                ).expand(*self.token_pos.shape)
-                token_pos = self.token_pos.maximum(other)
+                ).expand(*token_pos.shape)
+                token_pos = token_pos.maximum(other)
                 denom = (self.next_token_pos - token_pos).to(torch.float)
-                scores = self.scores / denom
+                scores = scores / denom
             self.next_position = scores.argmin(dim=-1)
 
 
@@ -141,4 +141,4 @@ class H2OOriginalKVCache(AttnWeightsKVCache):
             # Note: `next_position` is broadcast over the batch dimension
             self.next_position = self.scores.argmin(
                 dim=-1
-            ).unsqueeze(0).expand(self.batch_size, -1)
+            ).unsqueeze(0).expand(self.eff_batch_size, -1)

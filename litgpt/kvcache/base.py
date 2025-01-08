@@ -35,9 +35,13 @@ class KVCache(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
     ):
         """
+        Note that `batch_size` is the maximum batch size the cache can be used
+        with. The effective batch size is determined when calling
+        :meth:`prefill` and can change with any such call.
+
         Args:
             config: Model config
-            batch_size: Inference batch size
+            batch_size: Inference batch size (maximum)
             device: Device for buffers
             dtype: Data type for buffers
         """
@@ -66,12 +70,13 @@ class KVCache(torch.nn.Module):
         the last recent call of :meth:`update`.
 
         Args:
-            key: New keys, `(batch_size, n_query_groups, head_size)`
-            value: New values, `(batch_size, n_query_groups, head_size)`
+            key: New keys, `(eff_batch_size, n_query_groups, head_size)`
+            value: New values, `(eff_batch_size, n_query_groups, head_size)`
 
         Returns:
-            key_cached, value_cached, `(batch_size, n_query_groups, T, head_size)`,
-                where `T <= cache_length` is the current cache length
+            key_cached, value_cached, `(eff_batch_size, n_query_groups, T,
+                head_size)`, where `T <= cache_length` is the current cache
+                length
 
         """
         raise NotImplementedError()
@@ -102,11 +107,12 @@ class KVCache(torch.nn.Module):
         """
         Starts a generation loop by passing key and value tensors coming from
         a prefill with embeddings coming from the prompts. The length `T` must
-        be smaller or equal to `max_prefill_length`.
+        be smaller or equal to `max_prefill_length`. The effective batch size
+        must be `eff_batch_size <= batch_size`.
 
         Args:
-            key: Prefill keys, `(batch_size, n_query_groups, T, head_size)`
-            value: Prefill values, `(batch_size, n_query_groups, T, head_size)`
+            key: Prefill keys, `(eff_batch_size, n_query_groups, T, head_size)`
+            value: Prefill values, `(eff_batch_size, n_query_groups, T, head_size)`
         """
         raise NotImplementedError()
 
@@ -166,6 +172,7 @@ class DenseKVCache(KVCache):
         self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.next_position = None
+        self.eff_batch_size = None
 
     @property
     def next_token_pos(self) -> Optional[int]:
@@ -180,17 +187,20 @@ class DenseKVCache(KVCache):
             raise IndexError("Cache needs to be initialized with 'prefill' before being used")
         if self.next_position >= self.cache_length:
             raise IndexError("Cache is full, cannot add further content")
-        shape = (self.batch_size, self.n_query_groups, self.head_size)
+        shape = (self.eff_batch_size, self.n_query_groups, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         # Move the buffer to the activation dtype for when AMP is used
         self.k = self.k.to(key.dtype)
         self.v = self.v.to(value.dtype)
         # Append new content to cache
-        self.k[:, :, self.next_position, :] = key
-        self.v[:, :, self.next_position, :] = value
+        self.k[:self.eff_batch_size, :, self.next_position, :] = key
+        self.v[:self.eff_batch_size, :, self.next_position, :] = value
         self.next_position += 1
-        return self.k[:, :, :self.next_position, :], self.v[:, :, :self.next_position, :]
+        return (
+            self.k[:self.eff_batch_size, :, :self.next_position, :],
+            self.v[:self.eff_batch_size, :, :self.next_position, :],
+        )
 
     def update(self, *args, **kwargs):
         pass
@@ -201,15 +211,19 @@ class DenseKVCache(KVCache):
         init_length = key.shape[2]
         if init_length > self.cache_length:
             raise ValueError(f"key.shape[2] = {init_length}, must be at most {self.cache_length}")
-        shape = (self.batch_size, self.n_query_groups, init_length, self.head_size)
+        eff_batch_size = key.shape[0]
+        if eff_batch_size > self.batch_size:
+            raise ValueError(f"key.shape[0] = {eff_batch_size} must be at most batch_size = {self.batch_size}")
+        shape = (eff_batch_size, self.n_query_groups, init_length, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         # Initialize cache content
         self.k = self.k.to(key.dtype)
         self.v = self.v.to(value.dtype)
-        self.k[:, :, :init_length, :] = key
-        self.v[:, :, :init_length, :] = value
+        self.k[:eff_batch_size, :, :init_length, :] = key
+        self.v[:eff_batch_size, :, :init_length, :] = value
         self.next_position = init_length
+        self.eff_batch_size = eff_batch_size
 
     def token_positions(self) -> torch.Tensor:
         return torch.arange(self.next_position, device=self.device).reshape(
