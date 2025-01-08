@@ -121,6 +121,15 @@ class KVCache(torch.nn.Module):
             max_prefill_length=self.max_prefill_length,
         )
 
+    def token_positions(self) -> torch.Tensor:
+        """
+        Returns:
+            Token positions in slots of the cache, shape
+            `(batch_size, n_query_groups, T)`.where `T <= cache_length` is the
+            current cache length.
+        """
+        raise NotImplementedError()
+
 
 class DenseKVCache(KVCache):
     """
@@ -201,3 +210,8 @@ class DenseKVCache(KVCache):
         self.k[:, :, :init_length, :] = key
         self.v[:, :, :init_length, :] = value
         self.next_position = init_length
+
+    def token_positions(self) -> torch.Tensor:
+        return torch.arange(self.next_position, device=self.device).reshape(
+            1, 1, -1
+        ).expand(self.batch_size, self.n_query_groups, -1)

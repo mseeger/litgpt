@@ -68,6 +68,7 @@ class GPT(nn.Module):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
+        # Only used if `config.sliding_window_size` is set
         self.mask_cache: Optional[torch.Tensor] = None
         self.max_seq_length = self.config.block_size
 
@@ -111,10 +112,13 @@ class GPT(nn.Module):
                     max_sequence_length=value
                 )
         # Mask cache
-        if self.mask_cache is not None and self.mask_cache.shape[-1] < value:
-            kv_cache = self.transformer.h[0].attn.kv_cache
-            assert kv_cache is not None, "Internal error: mask_cache exists only along with KV caches"
-            self.mask_cache = build_mask_cache(value, device=kv_cache.device)
+        sw_size = self.config.sliding_window_size
+        if sw_size is not None and (self.mask_cache is None or self.mask_cache.shape[-1] < value):
+            self.mask_cache = build_mask_cache(
+                value,
+                sliding_window_size=sw_size,
+                device=self.cos.device,
+            )
 
     def reset_parameters(self) -> None:
         # Trigger resetting the rope-cache
@@ -198,18 +202,11 @@ class GPT(nn.Module):
             input_pos_array = torch.tensor(input_pos, device=self.cos.device)
             cos = batched_index_select(self.cos, 0, input_pos_array).unsqueeze(0)
             sin = batched_index_select(self.sin, 0, input_pos_array).unsqueeze(0)
-            mask = batched_index_select(self.mask_cache, 2, input_pos_array)
-            if mask.dim() > 4:
-                # the mask cache has a batch dim of 1 in addition to the one
-                # we get if input_pos has a batch dimension
-                mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
-            mask = mask[..., :input_pos]
         else:
             # Unsqueeze to have a batch dimension
             cos = self.cos[:T].unsqueeze(0)
             sin = self.sin[:T].unsqueeze(0)
             # `cos`, `sin` have shape (1, T, config.rope_n_elem)
-            mask = None  # Defaults to causal mask
 
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
         if self.config.scale_embeddings:
@@ -228,9 +225,7 @@ class GPT(nn.Module):
                         dtype=x.dtype,
                         max_sequence_length=self.max_seq_length,
                     )
-                if l_ix == 0:
-                    self.mask_cache = build_mask_cache(self.max_seq_length, device=x.device)
-            x = block(x, cos, sin, mask, input_pos, for_prefill)
+            x = block(x, cos, sin, input_pos, for_prefill, self.mask_cache)
 
         x = self.transformer.ln_f(x)
         clamp_head = partial(
@@ -330,9 +325,9 @@ class Block(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
         input_pos: Optional[int] = None,
         for_prefill: bool = False,
+        mask_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -360,9 +355,9 @@ class Block(nn.Module):
             x_normed,
             cos=cos,
             sin=sin,
-            mask=mask,
             input_pos=input_pos,
             for_prefill=for_prefill,
+            mask_cache=mask_cache,
         )
         attention_output = self.post_attention_norm(attention_output)
 
@@ -408,18 +403,18 @@ class CausalSelfAttention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
         input_pos: Optional[int] = None,
         for_prefill: bool = False,
+        mask_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             x: Input tensor
             cos: RoPE parameters
             sin: RoPE parameters
-            mask: Optional
             input_pos: See :meth:`GPT.forward`
             for_prefill: See :meth:`GPT.forward`
+            mask_cache: Used for building mask in special case
 
         Returns:
             Output tensor
@@ -494,31 +489,31 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, *, hs)
             v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, *, hs)
 
-        # TODO! This does not work if `input_pos` is given!
+        # In general, we don't need an attention mask. If `input_pos` is not
+        # given, we use causal masking with `is_causal=True`. Otherwise,
+        # generative attention is causal without masking.
+        is_causal = input_pos is None
+        mask = None
         if self.apply_sliding_window_attention:
-            """
-                  Global Window              Sliding window             Sliding window
-                  attention mask      +            bias          =      attention mask
-            ┌────────────────────────┐  ┌───────────────────────┐  ┌─────────────────────────┐
-            │ True False False False │  │ True  True  True True │  │ True  False False False │
-            │ True True  False False │  │ True  True  True True │  │ True  True  False False │
-            │ True True  True  False │  │ False True  True True │  │ False True  True  False │
-            │ True True  True  True  │  │ False False True True │  │ False False True  True  │
-            └────────────────────────┘  └───────────────────────┘  └─────────────────────────┘
-            """
-            if mask is None:
-                mask = torch.ones(T, T, dtype=q.dtype, device=q.device).triu(diagonal=1)
-                mask.masked_fill_(mask.bool(), float("-inf"))
-                mask = mask.view(1, 1, *mask.shape)
-            sliding_window_bias = torch.ones_like(mask).tril(diagonal=-self.config.sliding_window_size)
-            sliding_window_bias.masked_fill_(sliding_window_bias.bool(), float("-inf"))
-            mask += sliding_window_bias
+            # Special case requires building a mask
+            assert mask_cache is not None, "mask_cache must be given if sliding window attention is used"
+            if is_causal:
+                mask = mask_cache[:T, :T].view(1, 1, T, T)
+                is_causal = False
+            else:
+                mask = batched_index_select(
+                    mask_cache[:, input_pos:(input_pos + 1)],
+                    dim=0,
+                    idx=self.kv_cache.token_positions(),
+                )
 
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
         return_scores = input_pos is not None and isinstance(self.kv_cache, AttnWeightsKVCache)
-        y, scores = self.scaled_dot_product_attention(q, k, v, mask, return_scores)
+        y, scores = self.scaled_dot_product_attention(
+            q, k, v, mask, is_causal, return_scores
+        )
 
         if return_scores:
             # Pass attention weights to KV cache
@@ -537,8 +532,10 @@ class CausalSelfAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        is_causal: bool = True,
         return_scores: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        assert mask is None or not is_causal, "Cannot have mask and is_causal=True"
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
 
         # with softcapping we cannot use SDPA
@@ -550,6 +547,7 @@ class CausalSelfAttention(nn.Module):
                 scale=scale,
                 mask=mask,
                 attention_logit_softcapping=self.config.attention_logit_softcapping,
+                is_causal=is_causal,
             )
             if not return_scores:
                 scores = None
@@ -561,7 +559,7 @@ class CausalSelfAttention(nn.Module):
                 attn_mask=mask,
                 dropout_p=0.0,
                 scale=scale,
-                is_causal=mask is None,
+                is_causal=is_causal,
             )
             scores = None
         return y.transpose(1, 2), scores
@@ -672,15 +670,18 @@ def scaled_dot_product_attention(
     scale: float,
     mask: Optional[torch.Tensor] = None,
     attention_logit_softcapping: Optional[float] = None,
+    is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     dtype = query.dtype
     scores = query @ key.mT * scale
     scores = do_softcapping(scores, attention_logit_softcapping)
-    if mask is None:
+    if mask is None and is_causal:
         T = query.size(2)
+        assert key.size(2) == T, "is_causal=True only if query, key have same size"
         mask = torch.ones(T, T, dtype=dtype, device=query.device).triu(diagonal=1)
         mask.masked_fill_(mask.bool(), torch.finfo(query.dtype).min)
-    scores = scores + mask
+    if mask is not None:
+        scores = scores + mask
     scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)
     return scores @ value, scores
 
@@ -745,7 +746,11 @@ def build_rope_cache(
     return torch.cos(idx_theta), torch.sin(idx_theta)
 
 
-def batched_index_select(t, dim, idx):
+def batched_index_select(
+    t: torch.Tensor,
+    dim: int,
+    idx: torch.Tensor
+) -> torch.Tensor:
     """index_select for batched index and unbatched t"""
     if idx.dim() == 1:
         return torch.index_select(t, dim, idx)
@@ -803,9 +808,26 @@ def do_softcapping(x: torch.Tensor, thresh: Optional[float]) -> torch.Tensor:
         return x
 
 
-def build_mask_cache(max_seq_length: int, device: Optional[torch.device] = None) -> torch.Tensor:
-    ones = torch.ones((max_seq_length, max_seq_length), device=device, dtype=torch.bool)
-    return torch.tril(ones).unsqueeze(0).unsqueeze(0)
+def build_mask_cache(
+    max_seq_length: int,
+    sliding_window_size: int,
+    device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """
+          Global Window              Sliding window             Sliding window
+          attention mask      +            bias          =      attention mask
+    ┌────────────────────────┐  ┌───────────────────────┐  ┌─────────────────────────┐
+    │ True False False False │  │ True  True  True True │  │ True  False False False │
+    │ True True  False False │  │ True  True  True True │  │ True  True  False False │
+    │ True True  True  False │  │ False True  True True │  │ False True  True  False │
+    │ True True  True  True  │  │ False False True True │  │ False False True  True  │
+    └────────────────────────┘  └───────────────────────┘  └─────────────────────────┘
+    """
+    mask = torch.ones(max_seq_length, max_seq_length, device=device).triu(diagonal=1)
+    mask.masked_fill_(mask.bool(), float("-inf"))
+    sliding_window_bias = torch.ones_like(mask).tril(diagonal=-sliding_window_size)
+    sliding_window_bias.masked_fill_(sliding_window_bias.bool(), float("-inf"))
+    return mask + sliding_window_bias
 
 
 class RMSNorm(torch.nn.Module):

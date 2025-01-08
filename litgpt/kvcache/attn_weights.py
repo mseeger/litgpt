@@ -1,3 +1,4 @@
+from ast import Index
 from typing import Optional, Tuple
 
 import torch
@@ -167,6 +168,11 @@ class AttnWeightsKVCache(KVCache):
         # The cache is not completely full, so that :meth:`forward` can be
         # called without having to call :meth:`update` before
         self._set_next_position_constant(init_length)
+
+    def token_positions(self) -> torch.Tensor:
+        if self.current_length is None:
+            raise IndexError("Cache is not initialized, call 'prefill' first")
+        return self.token_pos[:, :, :self.current_length]
 
     def _set_next_position_constant(self, val: int):
         self.next_position = torch.full(
