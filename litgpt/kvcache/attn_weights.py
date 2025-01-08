@@ -1,4 +1,3 @@
-from ast import Index
 from typing import Optional, Tuple
 
 import torch

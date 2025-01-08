@@ -411,12 +411,7 @@ def batched_generate_fn(
     # maximum prefill length of the KV cache
     token_pos = min(prompt_size)
     kv_cache_params = model.get_kv_cache_params()
-    # TODO: KV cache batch size should be changeable with prefill call
-    if kv_cache_params is not None:
-        max_prefill_length = kv_cache_params.max_prefill_length
-        assert kv_cache_params.batch_size == batch_size, f"batch_size = {batch_size} != {kv_cache_params.batch_size} = kv_cache.batch_size"
-    else:
-        max_prefill_length = token_pos
+    max_prefill_length = token_pos if kv_cache_params is None else kv_cache_params.max_prefill_length
     token_pos = min([token_pos, max_prefill_length])
     inputs = torch.tensor(
         [prompt[:token_pos] for prompt in prompts],

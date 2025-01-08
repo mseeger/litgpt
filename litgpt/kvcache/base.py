@@ -83,10 +83,10 @@ class KVCache(torch.nn.Module):
 
     def update(self, *args, **kwargs):
         """
-        To be called after each `forward`, passing extra information depending
-        on the subclass. In general, this method updates internal scores and
-        takes a decision which slot is evicted upon the next `forward` call
-        (if the cache is full).
+        Some caches require this method to be called after each `forward`,
+        passing extra information depending on the subclass. In general,
+        this method updates internal scores and takes a decision which slot
+        is evicted upon the next `forward` call (if the cache is full).
 
         Args:
             *args: Depends on subclass
@@ -106,9 +106,10 @@ class KVCache(torch.nn.Module):
     def prefill(self, key: torch.Tensor, value: torch.Tensor):
         """
         Starts a generation loop by passing key and value tensors coming from
-        a prefill with embeddings coming from the prompts. The length `T` must
-        be smaller or equal to `max_prefill_length`. The effective batch size
-        must be `eff_batch_size <= batch_size`.
+        a prefill with embeddings coming from the prompts. The length must be
+        `T <= max_prefill_length`. The effective batch size must be
+        `eff_batch_size <= batch_size`. This batch size is then fixed for
+        subsequent calls of :meth:`forward` and :meth:`update`.
 
         Args:
             key: Prefill keys, `(eff_batch_size, n_query_groups, T, head_size)`
@@ -131,8 +132,8 @@ class KVCache(torch.nn.Module):
         """
         Returns:
             Token positions in slots of the cache, shape
-            `(batch_size, n_query_groups, T)`.where `T <= cache_length` is the
-            current cache length.
+            `(eff_batch_size, n_query_groups, T)`.where `T <= cache_length`
+            is the current cache length.
         """
         raise NotImplementedError()
 
@@ -228,4 +229,98 @@ class DenseKVCache(KVCache):
     def token_positions(self) -> torch.Tensor:
         return torch.arange(self.next_position, device=self.device).reshape(
             1, 1, -1
-        ).expand(self.batch_size, self.n_query_groups, -1)
+        ).expand(self.eff_batch_size, self.n_query_groups, -1)
+
+
+class MostRecentKVCache(KVCache):
+    """
+    Baseline key-value cache which stores the most recent `cache_length` key,
+    value tensors.
+    """
+    def __init__(
+        self,
+        config: Config,
+        batch_size: int,
+        cache_length: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """
+        Args:
+            config: Model config
+            batch_size: Inference batch size
+            cache_length: Number of slots of cache
+            device: Device for buffers
+            dtype: Data type for buffers
+        """
+        super().__init__(config, batch_size, device, dtype)
+        if cache_length <= 0:
+            raise ValueError("cache_length must be positive")
+        self.cache_length = cache_length
+        shape = (batch_size, self.n_query_groups, cache_length, self.head_size)
+        self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
+        self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
+        self.register_buffer("token_pos", torch.zeros(cache_length, device=device, dtype=torch.int), persistent=False)
+        self.next_position = None
+        self.eff_batch_size = None
+        self.current_length = None
+        self._next_token_pos = None
+
+    @property
+    def next_token_pos(self) -> Optional[int]:
+        return self._next_token_pos
+
+    @property
+    def max_prefill_length(self) -> int:
+        return self.cache_length
+
+    def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.next_position is None:
+            raise IndexError("Cache needs to be initialized with 'prefill' before being used")
+        shape = (self.eff_batch_size, self.n_query_groups, self.head_size)
+        if key.shape != shape or value.shape != shape:
+            raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
+        # Move the buffer to the activation dtype for when AMP is used
+        self.k = self.k.to(key.dtype)
+        self.v = self.v.to(value.dtype)
+        # Append new content to cache
+        self.k[:self.eff_batch_size, :, self.next_position, :] = key
+        self.v[:self.eff_batch_size, :, self.next_position, :] = value
+        self.token_pos[self.next_position] = self._next_token_pos
+        self.next_position = (self.next_position + 1) % self.cache_length
+        self.current_length = min(self.current_length + 1, self.cache_length)
+        self._next_token_pos += 1
+        return (
+            self.k[:self.eff_batch_size, :, :self.current_length, :],
+            self.v[:self.eff_batch_size, :, :self.current_length, :],
+        )
+
+    def update(self, *args, **kwargs):
+        pass
+
+    def prefill(self, key: torch.Tensor, value: torch.Tensor):
+        if key.dim() != 4:
+            raise ValueError("key must have 4 dimensions")
+        init_length = key.shape[2]
+        if init_length > self.max_prefill_length:
+            raise ValueError(f"key.shape[2] = {init_length}, must be at most {self.max_prefill_length}")
+        eff_batch_size = key.shape[0]
+        if eff_batch_size > self.batch_size:
+            raise ValueError(f"key.shape[0] = {eff_batch_size} must be at most batch_size = {self.batch_size}")
+        shape = (eff_batch_size, self.n_query_groups, init_length, self.head_size)
+        if key.shape != shape or value.shape != shape:
+            raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
+        # Initialize cache content
+        self.k = self.k.to(key.dtype)
+        self.v = self.v.to(value.dtype)
+        self.k[:eff_batch_size, :, :init_length, :] = key
+        self.v[:eff_batch_size, :, :init_length, :] = value
+        self.current_length = init_length
+        self._next_token_pos = init_length
+        self.next_position = init_length % self.cache_length
+        self.eff_batch_size = eff_batch_size
+
+    def token_positions(self) -> torch.Tensor:
+        return self.token_pos[:self.current_length].reshape(1, 1, -1).expand(
+            self.eff_batch_size, self.n_query_groups, -1
+        )
