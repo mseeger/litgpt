@@ -3,8 +3,9 @@ from typing import Optional, Tuple
 import torch
 
 from litgpt import Config
+from litgpt.kvcache.base import KVCacheParams
 from litgpt.kvcache.attn_weights import AttnWeightsKVCache
-from litgpt.kvcache.utils import bitsize_of
+from litgpt.kvcache.utils import bitsize_of, bits_for_torch_dtype
 
 
 class H2OKVCache(AttnWeightsKVCache):
@@ -88,6 +89,20 @@ class H2OKVCache(AttnWeightsKVCache):
     def size_estimate(self) -> int:
         return super().size_estimate() + bitsize_of(self.scores)
 
+    @staticmethod
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+        cache_length = kwargs.get("cache_length")
+        if cache_length is None:
+            raise IndexError("Argument 'cache_length' is missing")
+        else:
+            cache_length = int(cache_length)
+        dtype = params.dtype
+        if dtype is None:
+            raise ValueError("params.dtype must be provided")
+        numel = params.batch_size * params.n_query_groups * cache_length
+        add_here = numel * bits_for_torch_dtype(dtype)
+        return super().size_estimate_apriori(params, **kwargs) + add_here
+
 
 class H2OOriginalKVCache(AttnWeightsKVCache):
     """
@@ -149,3 +164,17 @@ class H2OOriginalKVCache(AttnWeightsKVCache):
 
     def size_estimate(self) -> int:
         return super().size_estimate() + bitsize_of(self.scores)
+
+    @staticmethod
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+        cache_length = kwargs.get("cache_length")
+        if cache_length is None:
+            raise IndexError("Argument 'cache_length' is missing")
+        else:
+            cache_length = int(cache_length)
+        dtype = params.dtype
+        if dtype is None:
+            raise ValueError("params.dtype must be provided")
+        numel = params.n_query_groups * cache_length
+        add_here = numel * bits_for_torch_dtype(dtype)
+        return super().size_estimate_apriori(params, **kwargs) + add_here

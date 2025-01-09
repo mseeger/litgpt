@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 
 from litgpt.config import Config
-from litgpt.kvcache.utils import bitsize_of
+from litgpt.kvcache.utils import bitsize_of, bits_for_torch_dtype
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,22 @@ class KVCacheParams:
     device: Optional[torch.device]
     dtype: Optional[torch.dtype]
     max_prefill_length: int
+
+    @staticmethod
+    def from_config(
+        config: Config,
+        batch_size: Optional[int] = None,
+        max_prefill_length: Optional[int] = None,
+    ) -> "KVCacheParams":
+        return KVCacheParams(
+            batch_size=batch_size,
+            n_query_groups = config.n_query_groups,
+            head_size = config.n_embd // config.n_head,
+            n_head = config.n_head,
+            device=None,
+            dtype=None,
+            max_prefill_length=max_prefill_length,
+        )
 
 
 class KVCache(torch.nn.Module):
@@ -150,6 +166,22 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
+    @staticmethod
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+        """
+        Same semantics as :meth:`size_estimate`, but can be called without a
+        cache being created. Results may not be exactly the same, but should
+        be close.
+
+        Args:
+            params: KV cache parameters
+            **kwargs: Extra arguments (optional)
+
+        Returns:
+            Estimate of number of bits the KV cache will occupy in memory.
+        """
+        raise NotImplementedError()
+
 
 class DenseKVCache(KVCache):
     """
@@ -247,6 +279,19 @@ class DenseKVCache(KVCache):
     def size_estimate(self) -> int:
         return bitsize_of(self.k) + bitsize_of(self.v)
 
+    @staticmethod
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+        max_sequence_length = kwargs.get("max_sequence_length")
+        if max_sequence_length is None:
+            raise IndexError("Argument 'max_sequence_length' is missing")
+        else:
+            max_sequence_length = int(max_sequence_length)
+        dtype = params.dtype
+        if dtype is None:
+            raise ValueError("params.dtype must be provided")
+        numel = params.batch_size * params.n_query_groups * max_sequence_length * params.head_size
+        return 2 * numel * bits_for_torch_dtype(dtype)
+
 
 class MostRecentKVCache(KVCache):
     """
@@ -343,3 +388,18 @@ class MostRecentKVCache(KVCache):
 
     def size_estimate(self) -> int:
         return bitsize_of(self.k) + bitsize_of(self.v) + bitsize_of(self.token_pos)
+
+    @staticmethod
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+        cache_length = kwargs.get("cache_length")
+        if cache_length is None:
+            raise IndexError("Argument 'cache_length' is missing")
+        else:
+            cache_length = int(cache_length)
+        dtype = params.dtype
+        if dtype is None:
+            raise ValueError("params.dtype must be provided")
+        numel = params.batch_size * params.n_query_groups * cache_length * params.head_size
+        k_and_v = 2 * numel * bits_for_torch_dtype(dtype)
+        tk_p = cache_length * bits_for_torch_dtype(torch.int)
+        return k_and_v + tk_p

@@ -3,8 +3,8 @@ from typing import Optional, Tuple
 import torch
 
 from litgpt import Config
-from litgpt.kvcache.base import KVCache
-from litgpt.kvcache.utils import bitsize_of
+from litgpt.kvcache.base import KVCache, KVCacheParams
+from litgpt.kvcache.utils import bitsize_of, bits_for_torch_dtype
 
 
 class AttnWeightsKVCache(KVCache):
@@ -185,6 +185,22 @@ class AttnWeightsKVCache(KVCache):
 
     def size_estimate(self) -> int:
         return bitsize_of(self.k) + bitsize_of(self.v) + bitsize_of(self.token_pos) + (0 if self.next_position is None else bitsize_of(self.next_position))
+
+    @staticmethod
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+        cache_length = kwargs.get("cache_length")
+        if cache_length is None:
+            raise IndexError("Argument 'cache_length' is missing")
+        else:
+            cache_length = int(cache_length)
+        dtype = params.dtype
+        if dtype is None:
+            raise ValueError("params.dtype must be provided")
+        numel_int = params.batch_size * params.n_query_groups * cache_length
+        numel_kv = numel_int * params.head_size
+        k_and_v = 2 * numel_kv * bits_for_torch_dtype(dtype)
+        numel_int += params.batch_size * params.n_query_groups
+        return k_and_v + numel_int * bits_for_torch_dtype(torch.int)
 
     def _set_next_position_constant(self, val: int):
         self.next_position = torch.full(
