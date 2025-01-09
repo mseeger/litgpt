@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 
 from litgpt.config import Config
+from litgpt.kvcache.utils import bitsize_of
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,18 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
+    def size_estimate(self) -> int:
+        """
+        This is a theoretical estimate of the main buffers (which should all
+        be allocated up front), it does not cover temporary storage used in
+        the methods (make sure these are small compared to the main buffers).
+        Also, real memory usage may be larger due to alignment issues.
+
+        Returns:
+            Estimate of number of bits the KV cache occupies in memory.
+        """
+        raise NotImplementedError()
+
 
 class DenseKVCache(KVCache):
     """
@@ -231,6 +244,9 @@ class DenseKVCache(KVCache):
             1, 1, -1
         ).expand(self.eff_batch_size, self.n_query_groups, -1)
 
+    def size_estimate(self) -> int:
+        return bitsize_of(self.k) + bitsize_of(self.v)
+
 
 class MostRecentKVCache(KVCache):
     """
@@ -324,3 +340,6 @@ class MostRecentKVCache(KVCache):
         return self.token_pos[:self.current_length].reshape(1, 1, -1).expand(
             self.eff_batch_size, self.n_query_groups, -1
         )
+
+    def size_estimate(self) -> int:
+        return bitsize_of(self.k) + bitsize_of(self.v) + bitsize_of(self.token_pos)

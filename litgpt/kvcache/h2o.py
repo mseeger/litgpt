@@ -4,6 +4,7 @@ import torch
 
 from litgpt import Config
 from litgpt.kvcache.attn_weights import AttnWeightsKVCache
+from litgpt.kvcache.utils import bitsize_of
 
 
 class H2OKVCache(AttnWeightsKVCache):
@@ -84,6 +85,9 @@ class H2OKVCache(AttnWeightsKVCache):
                 scores = scores / denom
             self.next_position = scores.argmin(dim=-1)
 
+    def size_estimate(self) -> int:
+        return super().size_estimate() + bitsize_of(self.scores)
+
 
 class H2OOriginalKVCache(AttnWeightsKVCache):
     """
@@ -142,3 +146,6 @@ class H2OOriginalKVCache(AttnWeightsKVCache):
             self.next_position = self.scores.argmin(
                 dim=-1
             ).unsqueeze(0).expand(self.eff_batch_size, -1)
+
+    def size_estimate(self) -> int:
+        return super().size_estimate() + bitsize_of(self.scores)

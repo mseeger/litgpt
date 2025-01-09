@@ -4,6 +4,7 @@ import torch
 
 from litgpt import Config
 from litgpt.kvcache.base import KVCache
+from litgpt.kvcache.utils import bitsize_of
 
 
 class AttnWeightsKVCache(KVCache):
@@ -181,6 +182,9 @@ class AttnWeightsKVCache(KVCache):
         if self.current_length is None:
             raise IndexError("Cache is not initialized, call 'prefill' first")
         return self.token_pos[:self.eff_batch_size, :, :self.current_length]
+
+    def size_estimate(self) -> int:
+        return bitsize_of(self.k) + bitsize_of(self.v) + bitsize_of(self.token_pos) + (0 if self.next_position is None else bitsize_of(self.next_position))
 
     def _set_next_position_constant(self, val: int):
         self.next_position = torch.full(
