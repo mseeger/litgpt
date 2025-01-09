@@ -1,6 +1,7 @@
 from typing import Optional, Tuple
 
 import torch
+from torch.linalg import vector_norm
 
 from litgpt import Config
 from litgpt.kvcache.base import KVCacheParams
@@ -68,7 +69,8 @@ class H2OKVCache(AttnWeightsKVCache):
         # Scores are computed in `torch.float`. Also, deal with
         # `n_query_groups < n_head` by averaging
         attn_weights = self._average_attn_weights(attn_weights.to(torch.float))
-        self.scores[:self.eff_batch_size, :, :self.current_length] += attn_weights
+        # Map weights to instant. scores, accumulate them
+        self.scores[:self.eff_batch_size, :, :self.current_length] += self._instantaneous_score(attn_weights)
         if self.current_length == self.cache_length:
             # Set `next_position` to score minimizers
             scores = self.scores[:self.eff_batch_size, ...]
@@ -86,6 +88,21 @@ class H2OKVCache(AttnWeightsKVCache):
                 scores = scores / denom
             self.next_position = scores.argmin(dim=-1)
 
+    def _instantaneous_score(self, attn_weights: torch.Tensor) -> torch.Tensor:
+        """
+        Computes score values for this round from attention weights. These score
+        values are accumulated.
+
+        Args:
+            attn_weights: Attention weights, shape
+            `(eff_batch_size, n_query_heads, current_length)`, dtype `float`.
+
+        Returns:
+            Instantaneous score values, same shape and dtype as `attn_weights`.
+
+        """
+        return attn_weights  # H2O accumulates attention weights directly
+
     def size_estimate(self) -> int:
         return super().size_estimate() + bitsize_of(self.scores)
 
@@ -102,6 +119,32 @@ class H2OKVCache(AttnWeightsKVCache):
         numel = params.batch_size * params.n_query_groups * cache_length
         add_here = numel * bits_for_torch_dtype(dtype)
         return super().size_estimate_apriori(params, **kwargs) + add_here
+
+
+class VLengthH2OKVCache(H2OKVCache):
+    """
+    Same as H2O in :class:`H2OKVCache`, but the instantaneous score is
+    modified to take the length of V vectors into account.
+    """
+    def _instantaneous_score(self, attn_weights: torch.Tensor) -> torch.Tensor:
+        """
+        The score is the attention weight times the v vector norm, normalized
+        to sum to 1 over the cache length dimension.
+
+        Args:
+            attn_weights: Attention weights, shape
+            `(eff_batch_size, n_query_heads, current_length)`, dtype `float`.
+
+        Returns:
+            Instantaneous score values, same shape and dtype as `attn_weights`.
+
+        """
+        scores = vector_norm(
+            self.v[:self.eff_batch_size, :, :self.current_length, :],
+            dim=-1,
+            dtype=torch.float
+        ) * attn_weights
+        return scores / scores.sum(dim=-1, keepdim=True)  # Normalize
 
 
 class H2OOriginalKVCache(AttnWeightsKVCache):
