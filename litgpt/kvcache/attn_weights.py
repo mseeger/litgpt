@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from litgpt import Config
+from litgpt.config import Config
 from litgpt.kvcache.base import KVCache, KVCacheParams
 from litgpt.kvcache.utils import bitsize_of, bits_for_torch_dtype
 

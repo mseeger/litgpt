@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 from torch.linalg import vector_norm
 
-from litgpt import Config
+from litgpt.config import Config
 from litgpt.kvcache.base import KVCacheParams
 from litgpt.kvcache.attn_weights import AttnWeightsKVCache
 from litgpt.kvcache.utils import bitsize_of, bits_for_torch_dtype
@@ -113,11 +113,8 @@ class H2OKVCache(AttnWeightsKVCache):
             raise IndexError("Argument 'cache_length' is missing")
         else:
             cache_length = int(cache_length)
-        dtype = params.dtype
-        if dtype is None:
-            raise ValueError("params.dtype must be provided")
         numel = params.batch_size * params.n_query_groups * cache_length
-        add_here = numel * bits_for_torch_dtype(dtype)
+        add_here = numel * bits_for_torch_dtype(torch.float)
         return super().size_estimate_apriori(params, **kwargs) + add_here
 
 
@@ -215,9 +212,6 @@ class H2OOriginalKVCache(AttnWeightsKVCache):
             raise IndexError("Argument 'cache_length' is missing")
         else:
             cache_length = int(cache_length)
-        dtype = params.dtype
-        if dtype is None:
-            raise ValueError("params.dtype must be provided")
         numel = params.n_query_groups * cache_length
-        add_here = numel * bits_for_torch_dtype(dtype)
+        add_here = numel * bits_for_torch_dtype(torch.float)
         return super().size_estimate_apriori(params, **kwargs) + add_here

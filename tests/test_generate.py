@@ -48,7 +48,12 @@ def test_generate(max_seq_length):
         return out
 
     with mock.patch("litgpt.generate.base.multinomial_num_samples_1", multinomial):
-        out = generate.generate(model, input_idx, T + max_new_tokens, top_k=1)
+        out = generate.generate(
+            model=model,
+            prompts=[input_idx],
+            max_returned_tokens=T + max_new_tokens,
+            top_k=1,
+        )[0]
 
     assert out.size(0) == T + max_new_tokens, (out.size(0), T + max_new_tokens)
     multinomial_results = torch.hstack(multinomial_results)
@@ -136,8 +141,18 @@ def test_generate_different_results_with_different_top_p():
     input_idx = torch.randint(10, size=(1,))
 
     torch.manual_seed(123)
-    output1 = generate.generate(model, input_idx, 20, top_p=1.0)
+    output1 = generate.generate(
+        model=model,
+        prompts=[input_idx],
+        max_returned_tokens=20,
+        top_p=1.0,
+    )[0]
     torch.manual_seed(123)
-    output2 = generate.generate(model, input_idx, 20, top_p=0.1)
+    output2 = generate.generate(
+        model=model,
+        prompts=[input_idx],
+        max_returned_tokens=20,
+        top_p=0.1,
+    )[0]
 
     assert not torch.equal(output1, output2)

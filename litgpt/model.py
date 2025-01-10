@@ -39,7 +39,7 @@ class GPT(nn.Module):
                 created with the first inference :meth:`forward` call, using
                 `max_seq_length` as size. This could result in an out of memory
                 error. For models to be used for inference, we recommend
-                passing a KV caches here.
+                passing KV caches here.
         """
         super().__init__()
         assert config.padded_vocab_size is not None
@@ -119,6 +119,52 @@ class GPT(nn.Module):
                 sliding_window_size=sw_size,
                 device=self.cos.device,
             )
+
+    def set_kv_cache(
+        self,
+        batch_size: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        max_seq_length: Optional[int] = None,
+    ):
+        """
+        This method can be called only if KV caches have not been passed at
+        construction. It creates default (dense) KV caches for every layer.
+
+        Calling this method is optional, default KV caches are otherwise
+        created when :meth:`forward` is called for inference for the first
+        time (i.e., with `for_prefill=True`).
+
+        Args:
+            batch_size: Inference batch size
+            device: Device for buffers
+            dtype: Data type for buffers
+            max_sequence_length: Cache length. If not given, we use
+                `self.max_seq_length`
+        """
+        if not self._default_kv_cache:
+            raise ValueError("KV caches have already been passed at construction")
+        if max_seq_length is None:
+            max_seq_length = self.max_seq_length
+        for l_ix, block in enumerate(self.transformer.h):
+            attn = block.attn
+            kv_cache = attn.kv_cache
+            if (
+                kv_cache is None or
+                kv_cache.batch_size != batch_size or
+                kv_cache.cache_length != max_seq_length or
+                kv_cache.device != device or
+                kv_cache.dtype != dtype
+            ):
+                if kv_cache is not None:
+                    device = kv_cache.device if device is None else device
+                    dtype = kv_cache.dtype if dtype is None else dtype
+                attn.create_default_kv_cache(
+                    batch_size=batch_size,
+                    device=device,
+                    dtype=dtype,
+                    max_sequence_length=max_seq_length,
+                )
 
     def reset_parameters(self) -> None:
         # Trigger resetting the rope-cache
@@ -214,13 +260,21 @@ class GPT(nn.Module):
 
         for l_ix, block in enumerate(self.transformer.h):
             if for_prefill:
-                # Create default KV caches if not present
+                # Create default KV caches if not present, or if batch size of
+                # cache is too small
+                batch_size = x.shape[0]
+                create_def_cache = False
                 attn = block.attn
                 if attn.kv_cache is None:
-                    # Same device and dtype as input `x`
                     print(f"Allocating KV cache for layer {l_ix}")
+                    create_def_cache = True
+                elif self._default_kv_cache and attn.kv_cache.batch_size < batch_size:
+                    print(f"Re-allocating KV cache for layer {l_ix} (batch size was too small)")
+                    create_def_cache = True
+                if create_def_cache:
+                    # Same device and dtype as input `x`
                     attn.create_default_kv_cache(
-                        batch_size=x.shape[0],
+                        batch_size=batch_size,
                         device=x.device,
                         dtype=x.dtype,
                         max_sequence_length=self.max_seq_length,

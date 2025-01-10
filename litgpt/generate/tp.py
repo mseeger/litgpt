@@ -241,8 +241,14 @@ def main(
     for i in range(num_samples):
         t0 = time.perf_counter()
         y = generate_base.generate(
-            model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, eos_id=tokenizer.eos_id
-        )
+            model=model,
+            prompts=[encoded],
+            max_returned_tokens=max_returned_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            eos_id=tokenizer.eos_id,
+        )[0]
         t = time.perf_counter() - t0
         for block in model.transformer.h:
             block.attn.kv_cache.reset_parameters()

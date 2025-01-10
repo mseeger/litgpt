@@ -236,9 +236,13 @@ class DenseKVCache(KVCache):
         shape = (self.eff_batch_size, self.n_query_groups, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
+        if key.dtype != value.dtype:
+            raise ValueError(f"key.dtype = {key.dtype} != {value.dtype} = value.dtype")
         # Move the buffer to the activation dtype for when AMP is used
-        self.k = self.k.to(key.dtype)
-        self.v = self.v.to(value.dtype)
+        if key.dtype != self.dtype:
+            self.dtype = key.dtype
+            self.k = self.k.to(self.dtype)
+            self.v = self.v.to(self.dtype)
         # Append new content to cache
         self.k[:self.eff_batch_size, :, self.next_position, :] = key
         self.v[:self.eff_batch_size, :, self.next_position, :] = value

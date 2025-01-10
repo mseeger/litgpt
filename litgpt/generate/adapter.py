@@ -133,7 +133,15 @@ def main(
 
     L.seed_everything(1234)
     t0 = time.perf_counter()
-    y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, top_p=top_p, eos_id=tokenizer.eos_id)
+    y = generate(
+        model=model,
+        prompts=[encoded],
+        max_returned_tokens=max_returned_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        eos_id=tokenizer.eos_id,
+    )[0]
     t = time.perf_counter() - t0
 
     output = tokenizer.decode(y)
