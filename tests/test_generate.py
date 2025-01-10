@@ -83,8 +83,8 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
 
     num_samples = 2
     out, err = StringIO(), StringIO()
-    with redirect_stdout(out), redirect_stderr(err):
-        generate.main(temperature=2.0, top_k=2, top_p=0.9, num_samples=num_samples, checkpoint_dir=fake_checkpoint_dir)
+    # with redirect_stdout(out), redirect_stderr(err):
+    generate.main(temperature=2.0, top_k=2, top_p=0.9, num_samples=num_samples, checkpoint_dir=fake_checkpoint_dir)
 
     assert len(tokenizer_mock.return_value.decode.mock_calls) == num_samples
     assert torch.allclose(tokenizer_mock.return_value.decode.call_args[0][0], generate_mock.return_value)
@@ -132,7 +132,14 @@ def test_sample(temperature):
 
 
 def test_generate_different_results_with_different_top_p():
-    config = Config(block_size=128, vocab_size=16, n_layer=1, n_head=4, n_embd=8)
+    config = Config(
+        block_size=128,
+        vocab_size=16,
+        n_layer=1,
+        n_head=4,
+        n_embd=8,
+        rotary_percentage=1,
+    )
     model = GPT(config)
     model.max_seq_length = 50
     model.set_kv_cache(batch_size=1)

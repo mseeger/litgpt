@@ -13,6 +13,7 @@ import torch._dynamo.config
 import torch._inductor.config
 from lightning.fabric.plugins import BitsandbytesPrecision
 from lightning_utilities.core.imports import RequirementCache
+from lxml.html.diff import token
 
 from litgpt.model import GPT
 from litgpt.config import Config
@@ -55,7 +56,12 @@ def sample(
 ) -> torch.Tensor:
     if top_p < 0.0 or top_p > 1.0:
         raise ValueError(f"top_p must be in [0, 1], got {top_p}")
-    logits = logits[0, -1]
+    if logits.dim() > 3:
+        raise ValueError(f"logits must have dim 2 or 3, got {logits.shape}")
+    elif logits.dim() == 2:
+        logits = logits[-1]
+    elif logits.dim() == 3:
+        logits = logits[0, -1]
     # optionally crop the logits to only the top k options
     if top_k is not None:
         v, i = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -413,10 +419,9 @@ def batched_generate_fn(
     kv_cache_params = model.get_kv_cache_params()
     max_prefill_length = token_pos if kv_cache_params is None else kv_cache_params.max_prefill_length
     token_pos = min([token_pos, max_prefill_length])
-    inputs = torch.tensor(
-        [prompt[:token_pos] for prompt in prompts],
-        dtype=prompt_dtype,
-        device=device
+    inputs = torch.cat(
+        [prompt[:token_pos].view(1, -1) for prompt in prompts],
+        dim=0,
     )
     # We only need the last time slice of `all_logits` below:
     all_logits = model(inputs, for_prefill=True)
@@ -475,9 +480,15 @@ def batched_generate_fn(
         else:
             safe_idx = min(len(l) for l in token_lists)
         if yielded_idx < safe_idx:
-            yield [
-                token_list[yielded_idx:safe_idx] for token_list in token_lists
+            y_tokens = [
+                torch.tensor(
+                    token_list[yielded_idx:safe_idx],
+                    dtype=prompt_dtype,
+                    device=device,
+                )
+                for token_list in token_lists
             ]
+            yield y_tokens
             yielded_idx = safe_idx
 
         # Update input_pos for the next iteration
@@ -498,7 +509,12 @@ def batched_generate_fn(
     max_token_lists = max(safe_idxes)
     if yielded_idx < max_token_lists:
         y_tokens = [
-            None if yielded_idx == safe_idx else tokens[yielded_idx:safe_idx]
+            None if yielded_idx == safe_idx else
+            torch.tensor(
+                tokens[yielded_idx:safe_idx],
+                dtype=prompt_dtype,
+                device=device,
+            )
             for safe_idx, tokens in zip(safe_idxes, token_lists)
         ]
         yield y_tokens
@@ -559,12 +575,14 @@ def generate(
             top_k=top_k,
             top_p=top_p,
         ),
-        stop_tokens=([eos_id],) if eos_id is not None else (),
-        include_prompt = include_prompt,
-        include_eos = include_eos,
+        stop_tokens=(([eos_id],) if eos_id is not None else ()),
+        include_prompt=include_prompt,
+        include_eos=include_eos,
     ):
         for tl, p in zip(token_list, part):
-            tl.append(p)
+            if p is not None:
+                tl.append(p)
+
     return [torch.cat(parts) for parts in token_list]
 
 
@@ -680,22 +698,37 @@ def main(
     L.seed_everything(1234)
     for i in range(num_samples):
         t0 = time.perf_counter()
-        y = generate(
+        #y = generate(
+        #    model=model,
+        #    prompts=[encoded],
+        #    max_returned_tokens=max_returned_tokens,
+        #    temperature=temperature,
+        #    top_k=top_k,
+        #    top_p=top_p,
+        #    eos_id=tokenizer.eos_id,
+        #)[0]
+        eos_id = tokenizer.eos_id
+        y = list(batched_generate_fn(
             model=model,
             prompts=[encoded],
             max_returned_tokens=max_returned_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            eos_id=tokenizer.eos_id,
-        )[0]
+            sample_args=dict(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            ),
+            stop_tokens=(([eos_id],) if eos_id is not None else ()),
+            include_prompt=True,
+            include_eos=True,
+        ))
+        print(f"y = {y}")
         t = time.perf_counter() - t0
-        for block in model.transformer.h:
-            block.attn.kv_cache.reset_parameters()
         fabric.print(tokenizer.decode(y))
         tokens_generated = y.size(0) - prompt_length
         fabric.print(
             f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr
         )
+    for block in model.transformer.h:
+        block.attn.kv_cache.reset_parameters()
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB", file=sys.stderr)

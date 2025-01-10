@@ -64,6 +64,7 @@ class GPT(nn.Module):
                 h=nn.ModuleList(
                     Block(config, block_idx, kv_cache=kvc)
                     for block_idx, kvc in enumerate(kv_cache)
+                    for block_idx, kvc in enumerate(kv_cache)
                 ),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
@@ -146,7 +147,7 @@ class GPT(nn.Module):
             raise ValueError("KV caches have already been passed at construction")
         if max_seq_length is None:
             max_seq_length = self.max_seq_length
-        for l_ix, block in enumerate(self.transformer.h):
+        for block in self.transformer.h:
             attn = block.attn
             kv_cache = attn.kv_cache
             if (
@@ -228,6 +229,8 @@ class GPT(nn.Module):
             entry can be shorter.
 
         """
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -245,9 +248,12 @@ class GPT(nn.Module):
                     raise ValueError(f"KV cache for layer {l_ix}: input_pos = {input_pos} != {self.kv_cache.next_token_pos} = kv_cache.next_token_pos")
             for_prefill = False
 
-            input_pos_array = torch.tensor(input_pos, device=self.cos.device)
-            cos = batched_index_select(self.cos, 0, input_pos_array).unsqueeze(0)
-            sin = batched_index_select(self.sin, 0, input_pos_array).unsqueeze(0)
+            input_pos_array = torch.tensor([input_pos], device=self.cos.device)
+            if self.config.rope_n_elem > 0:
+                cos = batched_index_select(self.cos, 0, input_pos_array).unsqueeze(0)
+                sin = batched_index_select(self.sin, 0, input_pos_array).unsqueeze(0)
+            else:
+                cos = sin = None
         else:
             # Unsqueeze to have a batch dimension
             cos = self.cos[:T].unsqueeze(0)
@@ -522,14 +528,15 @@ class CausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)  # (B, nh_v, T, hs)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
-        q_roped = apply_rope(q[..., : rope_n_elem], cos, sin)
-        k_roped = apply_rope(k[..., : rope_n_elem], cos, sin)
-        q = torch.cat((q_roped, q[..., rope_n_elem :]), dim=-1)  # (B, nh_q, T, hs)
-        k = torch.cat((k_roped, k[..., rope_n_elem :]), dim=-1)  # (B, nh_k, T, hs)
+        if rope_n_elem > 0:
+            q_roped = apply_rope(q[..., : rope_n_elem], cos, sin)
+            k_roped = apply_rope(k[..., : rope_n_elem], cos, sin)
+            q = torch.cat((q_roped, q[..., rope_n_elem :]), dim=-1)  # (B, nh_q, T, hs)
+            k = torch.cat((k_roped, k[..., rope_n_elem :]), dim=-1)  # (B, nh_k, T, hs)
 
         if input_pos is not None:
             # Extend KV cache and retrieve key, value tensors to be used
-            k, v = self.kv_cache(k, v)
+            k, v = self.kv_cache(k.squeeze(-2), v.squeeze(-2))
             # k, v: (B, nh_k, cache_length, hs)
         elif for_prefill:
             # Prefill KV cache
