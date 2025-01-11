@@ -565,23 +565,26 @@ def generate(
     """
 
     token_list = [[] for _ in range(len(prompts))]
-    for part in batched_generate_fn(
-        model=model,
-        prompts=prompts,
-        max_returned_tokens=max_returned_tokens,
-        sample_args=dict(
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        ),
-        stop_tokens=(([eos_id],) if eos_id is not None else ()),
-        include_prompt=include_prompt,
-        include_eos=include_eos,
-    ):
+    all_parts = list(
+        batched_generate_fn(
+            model=model,
+            prompts=prompts,
+            max_returned_tokens=max_returned_tokens,
+            sample_args=dict(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            ),
+            stop_tokens=(([eos_id],) if eos_id is not None else ()),
+            include_prompt=include_prompt,
+            include_eos=include_eos,
+        )
+    )
+
+    for part in all_parts:
         for tl, p in zip(token_list, part):
             if p is not None:
                 tl.append(p)
-
     return [torch.cat(parts) for parts in token_list]
 
 
@@ -695,7 +698,7 @@ def main(
     fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
     L.seed_everything(1234)
-    _debug = True
+    _debug = False
     for i in range(num_samples):
         t0 = time.perf_counter()
         if not _debug:
@@ -723,15 +726,12 @@ def main(
                 include_prompt=True,
                 include_eos=True,
             ))
-            print(f"y = {y}")
             token_list = [[]]
             for part in y:
                 for tl, p in zip(token_list, part):
                     if p is not None:
                         tl.append(p)
-            print(f"token_list = {token_list}")
             y = [torch.cat(parts) for parts in token_list]
-            print(f"y = {y}")
             y = y[0]
         t = time.perf_counter() - t0
         fabric.print(tokenizer.decode(y))

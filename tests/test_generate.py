@@ -65,11 +65,18 @@ def test_generate(max_seq_length):
 @skip_in_ci_on_macos
 def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
     config_path = fake_checkpoint_dir / "model_config.yaml"
-    config = {"block_size": 128, "vocab_size": 50, "n_layer": 2, "n_head": 4, "n_embd": 8, "rotary_percentage": 1}
+    config = {
+        "block_size": 128,
+        "vocab_size": 50,
+        "n_layer": 2,
+        "n_head": 4,
+        "n_embd": 8,
+        "rotary_percentage": 1,
+    }
     config_path.write_text(yaml.dump(config))
 
     module_mock = Mock()
-    module_mock.config.block_size = 128
+    module_mock.config.block_size = config["block_size"]
     load_mock = Mock()
     load_mock.return_value = load_mock
     monkeypatch.setattr(generate, "load_checkpoint", load_mock)
@@ -78,19 +85,37 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
     tokenizer_mock.return_value.decode.return_value = "foo bar baz"
     monkeypatch.setattr(generate, "Tokenizer", tokenizer_mock)
     generate_mock = Mock()
-    generate_mock.return_value = torch.tensor([3, 2, 1])
+    generate_mock.return_value = torch.tensor(
+        [
+            1, 2, 3, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+            0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0,
+            0, 0, 0, 1, 1, 1, 1, 1, 0
+        ]
+    )
     monkeypatch.setattr(generate, "generate", generate_mock)
 
     num_samples = 2
     out, err = StringIO(), StringIO()
-    # with redirect_stdout(out), redirect_stderr(err):
-    generate.main(temperature=2.0, top_k=2, top_p=0.9, num_samples=num_samples, checkpoint_dir=fake_checkpoint_dir)
+    sample_kwargs = dict(
+        temperature=2.0,
+        top_k=2,
+        top_p=0.9,
+    )
+    with redirect_stdout(out), redirect_stderr(err):
+        generate.main(
+            **sample_kwargs,
+            num_samples=num_samples,
+            checkpoint_dir=fake_checkpoint_dir,
+        )
 
     assert len(tokenizer_mock.return_value.decode.mock_calls) == num_samples
-    assert torch.allclose(tokenizer_mock.return_value.decode.call_args[0][0], generate_mock.return_value)
+    assert torch.allclose(
+        tokenizer_mock.return_value.decode.call_args[0][0].to(torch.device("cpu")),
+        generate_mock.return_value
+    )
     assert (
         generate_mock.mock_calls
-        == [call(ANY, tensor_like, 53, temperature=2.0, top_k=2, top_p=0.9, eos_id=tokenizer_mock.return_value.eos_id)]
+        == [call(ANY, tensor_like, 53, **sample_kwargs, eos_id=tokenizer_mock.return_value.eos_id)]
         * num_samples
     )
     expected_output = "foo bar baz\n" * num_samples
