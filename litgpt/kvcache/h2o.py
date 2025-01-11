@@ -38,9 +38,12 @@ class H2OKVCache(AttnWeightsKVCache):
         cache_length: int,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        grace_period: int = 0,
         normalize_scores: bool = False,
     ):
-        super().__init__(config, batch_size, cache_length, device, dtype)
+        super().__init__(
+            config, batch_size, cache_length, device, dtype, grace_period
+        )
         self.normalize_scores = normalize_scores
         shape = (batch_size, self.n_query_groups, cache_length)
         self.register_buffer("scores", torch.zeros(shape, device=device, dtype=torch.float), persistent=False)
@@ -50,9 +53,16 @@ class H2OKVCache(AttnWeightsKVCache):
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.next_position is not None:
-            # Reset score values for slots where the new token will be written
             index = self.next_position.unsqueeze(-1)
-            self.scores[:self.eff_batch_size, ...].scatter_(-1, index, 0.0)
+            if self.grace_period == 0 or self.current_length < self.cache_length:
+                # Reset score values for slots where the new token will be written
+                self.scores[:self.eff_batch_size, ...].scatter_(-1, index, 0.0)
+            else:
+                # Copy score values from grace region
+                scores_src = self.scores[:self.eff_batch_size, :, self.next_grace_pos]
+                self.scores[:self.eff_batch_size, ...].scatter_(-1, index, scores_src)
+                # Slot to be written to is in grace region:
+                self.scores[:self.eff_batch_size, :, self.next_grace_pos] = 0.0
         return super().forward(key, value)
 
     def prefill(self, key: torch.Tensor, value: torch.Tensor):
@@ -72,11 +82,12 @@ class H2OKVCache(AttnWeightsKVCache):
         # Map weights to instant. scores, accumulate them
         self.scores[:self.eff_batch_size, :, :self.current_length] += self._instantaneous_score(attn_weights)
         if self.current_length == self.cache_length:
+            limit = self.cache_length - self.grace_period
             # Set `next_position` to score minimizers
-            scores = self.scores[:self.eff_batch_size, ...]
+            scores = self.scores[:self.eff_batch_size, :, :limit]
             if self.normalize_scores:
                 # Normalize cumulative scores
-                token_pos = self.token_pos[:self.eff_batch_size, ...]
+                token_pos = self.token_pos[:self.eff_batch_size, :, :limit]
                 other = torch.full(
                     (1, 1, 1),
                     self.prefill_length - 1,

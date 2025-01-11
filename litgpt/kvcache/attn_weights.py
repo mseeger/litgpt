@@ -13,6 +13,22 @@ class AttnWeightsKVCache(KVCache):
     (via :meth:`update`) in every round. In general, these weights are used to
     compute scores, based on which eviction decisions are taken. All of this
     happens in :meth:`_update`, which subclasses need to implement.
+
+    Grace period:
+
+    If `grace_period > 0` (must be `< cache_length`), tokens are kept in the
+    cache for at least this many rounds before being considered for eviction.
+    This prevents most recent tokens to be evicted based on a noisy score
+    value.
+
+    Technically, the final `grace_period` slots are reserved for these grace
+    tokens. This part is organized as a ring buffer, the next slot to be
+    written to is `next_grace_pos`. In :meth:`forward`, the slot at
+    `next_grace_pos` is copied to `next_position`, and the new token content
+    is written to `next_grace_pos`. In subclasses, scores are computed and
+    accumulated for all slots, but only the values left of the grace slots
+    are used to determine `next_position`.
+
     """
     def __init__(
         self,
@@ -21,6 +37,7 @@ class AttnWeightsKVCache(KVCache):
         cache_length: int,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        grace_period: int = 0,
     ):
         """
         Args:
@@ -29,11 +46,16 @@ class AttnWeightsKVCache(KVCache):
             cache_length: Number of slots (i.e., tokens) in cache
             device: Device for buffers
             dtype: Data type for buffers
+            grace_period: Grace period, see header comment. Defaults to 0
+                (no grace period)
         """
         super().__init__(config, batch_size, device, dtype)
         if cache_length <= 0:
             raise ValueError("cache_length must be positive integer")
+        if not (0 <= grace_period < cache_length):
+            raise ValueError(f"Must have 0 <= grace_period < {cache_length}, but grace_period = {grace_period}")
         self.cache_length = cache_length
+        self.grace_period = grace_period
         shape = (batch_size, self.n_query_groups, cache_length, self.head_size)
         self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
@@ -49,6 +71,7 @@ class AttnWeightsKVCache(KVCache):
         self.current_length = None
         self.just_updated = False
         self.eff_batch_size = None
+        self.next_grace_pos = None
 
     @property
     def next_token_pos(self) -> Optional[int]:
@@ -68,14 +91,33 @@ class AttnWeightsKVCache(KVCache):
         key = key.to(device=self.device, dtype=self.dtype)
         value = value.to(device=self.device, dtype=self.dtype)
         # Write new content into slot
+        use_grace_period = self.grace_period > 0 and self.current_length == self.cache_length
+        if use_grace_period:
+            # For grace period, we need to copy
+            key_source = self.k[:self.eff_batch_size, :, self.next_grace_pos, :]
+            value_source = self.v[:self.eff_batch_size, :, self.next_grace_pos, :]
+            # Position of oldest token in grace region:
+            next_token_pos = self._next_token_pos - self.grace_period
+        else:
+            key_source = key
+            value_source = value
+            next_token_pos = self._next_token_pos
         # `next_position` is batched index, shape `(eff_batch_size, n_query_groups)`
         index = self.next_position.unsqueeze(-1)
         # `index[i, j, 0] = next_position[i, j]`
-        self.token_pos[:self.eff_batch_size, ...].scatter_(-1, index, self._next_token_pos)
+        self.token_pos[:self.eff_batch_size, ...].scatter_(-1, index, next_token_pos)
         index = index.unsqueeze(-1).expand(-1, -1, 1, self.head_size)
         # `index[i, j, 0, k] = next_position[i, j]`
-        self.k[:self.eff_batch_size, ...].scatter_(-2, index, key.unsqueeze(2))
-        self.v[:self.eff_batch_size, ...].scatter_(-2, index, value.unsqueeze(2))
+        self.k[:self.eff_batch_size, ...].scatter_(-2, index, key_source.unsqueeze(2))
+        self.v[:self.eff_batch_size, ...].scatter_(-2, index, value_source.unsqueeze(2))
+        if use_grace_period:
+            # Write new content into grace slot
+            self.token_pos[:self.eff_batch_size, :, self.next_grace_pos] = self._next_token_pos
+            self.k[:self.eff_batch_size, :, self.next_grace_pos, :] = key
+            self.v[:self.eff_batch_size, :, self.next_grace_pos, :] = value
+            prefix = self.cache_length - self.grace_period
+            # Increment in round-robin fashion:
+            self.next_grace_pos = (self.next_grace_pos - prefix + 1) % self.grace_period + prefix
         self.current_length = min(self.cache_length, self.current_length + 1)
         self.just_updated = False
         self.next_position = None  # Set by next :meth:`update` call
@@ -89,7 +131,9 @@ class AttnWeightsKVCache(KVCache):
         """
         Needs argument `attn_weights` to be passed. This method needs to set
         `self.next_position` to the slot position where :meth:`forward` is to
-        write the new key, value information.
+        write the new key, value information. If `grace_period > 0` and the
+        cache is full, entries in `self.next_position` must be smaller than
+        `self.cache_lenght - self.grace_period`.
 
         Args:
             attn_weights: Attention weights for the multi-head attention
@@ -126,6 +170,12 @@ class AttnWeightsKVCache(KVCache):
         this must be constant equal to `current_length` (see
         :meth:`_set_next_position_constant`). This assignment is done at the
         end of :meth:`update`, so this method does not have to do it.
+
+        If `grace_period > 0` and the cache is full, entries in `next_position`
+        must be smaller than `cache_length - grace_period`. Score values should
+        be computed and accumulated over all slot position, but the score
+        minimization to determine `next_position` must be done on the initial
+        part without the grace region.
 
         Args:
             attn_weights: Attention weights for the multi-head attention
@@ -177,6 +227,9 @@ class AttnWeightsKVCache(KVCache):
         # The cache is not completely full, so that :meth:`forward` can be
         # called without having to call :meth:`update` before
         self._set_next_position_constant(init_length)
+        if self.grace_period > 0:
+            # First slot to move out once the cache is full
+            self.next_grace_pos = self.cache_length - self.grace_period
 
     def token_positions(self) -> torch.Tensor:
         if self.current_length is None:
