@@ -101,12 +101,12 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
         top_k=2,
         top_p=0.9,
     )
-    with redirect_stdout(out), redirect_stderr(err):
-        generate.main(
-            **sample_kwargs,
-            num_samples=num_samples,
-            checkpoint_dir=fake_checkpoint_dir,
-        )
+    #with redirect_stdout(out), redirect_stderr(err):
+    generate.main(
+        **sample_kwargs,
+        num_samples=num_samples,
+        checkpoint_dir=fake_checkpoint_dir,
+    )
 
     assert len(tokenizer_mock.return_value.decode.mock_calls) == num_samples
     assert torch.allclose(

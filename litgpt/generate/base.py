@@ -698,7 +698,8 @@ def main(
     fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
     L.seed_everything(1234)
-    _debug = False
+    _debug = True
+    print(f"max_returned_tokens = {max_returned_tokens}, eos = {tokenizer.eos_id}")
     for i in range(num_samples):
         t0 = time.perf_counter()
         if not _debug:
@@ -712,7 +713,8 @@ def main(
                 eos_id=tokenizer.eos_id,
             )[0]
         else:
-            eos_id = tokenizer.eos_id
+            eos_id = None
+            #eos_id = int(tokenizer.eos_id)
             y = list(batched_generate_fn(
                 model=model,
                 prompts=[encoded],
@@ -733,6 +735,7 @@ def main(
                         tl.append(p)
             y = [torch.cat(parts) for parts in token_list]
             y = y[0]
+            print(y)
         t = time.perf_counter() - t0
         fabric.print(tokenizer.decode(y))
         tokens_generated = y.size(0) - prompt_length
