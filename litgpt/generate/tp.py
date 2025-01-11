@@ -250,8 +250,7 @@ def main(
             eos_id=tokenizer.eos_id,
         )[0]
         t = time.perf_counter() - t0
-        for block in model.transformer.h:
-            block.attn.kv_cache.reset_parameters()
+        model.clear_kv_cache()
         fabric.print(tokenizer.decode(y))
         tokens_generated = y.size(0) - prompt_length
         fabric.print(

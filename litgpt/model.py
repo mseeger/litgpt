@@ -64,7 +64,6 @@ class GPT(nn.Module):
                 h=nn.ModuleList(
                     Block(config, block_idx, kv_cache=kvc)
                     for block_idx, kvc in enumerate(kv_cache)
-                    for block_idx, kvc in enumerate(kv_cache)
                 ),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )

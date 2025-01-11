@@ -18,8 +18,8 @@ class AttnWeightsKVCache(KVCache):
 
     If `grace_period > 0` (must be `< cache_length`), tokens are kept in the
     cache for at least this many rounds before being considered for eviction.
-    This prevents most recent tokens to be evicted based on a noisy score
-    value.
+    This prevents the most recent tokens to be evicted based on noisy score
+    values.
 
     Technically, the final `grace_period` slots are reserved for these grace
     tokens. This part is organized as a ring buffer, the next slot to be
