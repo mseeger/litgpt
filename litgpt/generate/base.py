@@ -562,29 +562,26 @@ def generate(
             the prompt style) to the output.
         include_eos: If true (default), include <eos> token at the end of
             sequences. Otherwise, this token is stipped off.
+
     """
-
     token_list = [[] for _ in range(len(prompts))]
-    all_parts = list(
-        batched_generate_fn(
-            model=model,
-            prompts=prompts,
-            max_returned_tokens=max_returned_tokens,
-            sample_args=dict(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            ),
-            stop_tokens=(([eos_id],) if eos_id is not None else ()),
-            include_prompt=include_prompt,
-            include_eos=include_eos,
-        )
-    )
-
-    for part in all_parts:
+    for part in batched_generate_fn(
+        model=model,
+        prompts=prompts,
+        max_returned_tokens=max_returned_tokens,
+        sample_args=dict(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        ),
+        stop_tokens=(([eos_id],) if eos_id is not None else ()),
+        include_prompt=include_prompt,
+        include_eos=include_eos,
+    ):
         for tl, p in zip(token_list, part):
             if p is not None:
                 tl.append(p)
+
     return [torch.cat(parts) for parts in token_list]
 
 
