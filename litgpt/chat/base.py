@@ -60,18 +60,21 @@ def generate(
             or https://huyenchip.com/2024/01/16/sampling.html#top_p
         stop_tokens: If specified, stop generating any more token once one of this list is generated.
     """
-    from litgpt.generate.base import generate_fn
-    return generate_fn(
-        include_prompt=False,
-        include_eos=False,
+    from litgpt.generate.base import batched_generate_fn
+    for part in batched_generate_fn(
         model=model,
         prompt=prompt,
         max_returned_tokens=max_returned_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        stop_tokens=stop_tokens
-    )
+            sqmple_args = dict(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        ),
+        stop_tokens=stop_tokens,
+        include_prompt=False,
+        include_eos=False,
+    ):
+        yield part[0]
 
 
 def process_prompt(prompt, model, tokenizer, prompt_style, fabric, temperature, max_new_tokens, top_k, top_p, stop_tokens):

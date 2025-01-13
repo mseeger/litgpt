@@ -261,7 +261,6 @@ def main(
         torch._inductor.config.coordinate_descent_tuning = True
         # cannot use cudagraphs because it doesn't support multiple device indices
         # https://github.com/pytorch/pytorch/blob/v2.2.0-rc5/torch/_inductor/compile_fx.py#L371-L375
-        generate_base.next_token = torch.compile(generate_base.next_token)
 
     L.seed_everything(1234)
     for i in range(num_samples):

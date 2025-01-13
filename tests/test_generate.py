@@ -62,6 +62,64 @@ def test_generate(max_seq_length):
     torch.testing.assert_close(out, expected)
 
 
+@pytest.mark.parametrize(
+    "max_seq_length",
+    (
+        10,
+        20 + 5,
+        128,
+    ),
+)
+def test_generate_single_vs_batch(max_seq_length):
+    import lightning as L
+    L.seed_everything(1234)
+
+    max_prompt_size = int(max_seq_length * 0.75)
+    num_prompts = 6
+    vocab_size = 128
+    prompts = [
+        torch.randint(
+            low=0,
+            high=vocab_size,
+            size=(torch.randint(low=1, high=max_prompt_size, size = (1,)).item(),)
+        )
+        for _ in range(num_prompts)
+    ]
+    print(f"max_seq_length = {max_seq_length}")
+
+    config = Config(
+        block_size=128,
+        vocab_size=vocab_size,
+        n_layer=2,
+        n_head=4,
+        n_embd=8,
+        rotary_percentage=1,
+    )
+    model = GPT(config)
+    model.max_seq_length = max_seq_length
+
+    res_batch = generate.generate(
+        model=model,
+        prompts=prompts,
+        max_returned_tokens=max_seq_length,
+        top_k=1,
+    )
+    res_single = [
+        generate.generate(
+            model=model,
+            prompts=[prompt],
+            max_returned_tokens=max_seq_length,
+            top_k=1,
+        )[0]
+        for prompt in prompts
+    ]
+
+    for rb, rs in zip(res_batch, res_single):
+        print(f"{rs}\n{rb}")
+        torch.testing.assert_close(rs, rb)
+        print("OK")
+
+
 @skip_in_ci_on_macos
 def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
     config_path = fake_checkpoint_dir / "model_config.yaml"
@@ -101,12 +159,12 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
         top_k=2,
         top_p=0.9,
     )
-    #with redirect_stdout(out), redirect_stderr(err):
-    generate.main(
-        **sample_kwargs,
-        num_samples=num_samples,
-        checkpoint_dir=fake_checkpoint_dir,
-    )
+    with redirect_stdout(out), redirect_stderr(err):
+        generate.main(
+            **sample_kwargs,
+            num_samples=num_samples,
+            checkpoint_dir=fake_checkpoint_dir,
+        )
 
     assert len(tokenizer_mock.return_value.decode.mock_calls) == num_samples
     assert torch.allclose(

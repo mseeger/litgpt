@@ -171,7 +171,7 @@ class KVCache(torch.nn.Module):
         """
         Same semantics as :meth:`size_estimate`, but can be called without a
         cache being created. Results may not be exactly the same, but should
-        be close.
+        be very close.
 
         Args:
             params: KV cache parameters

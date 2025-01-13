@@ -235,7 +235,6 @@ def main(
         torch._dynamo.config.automatic_dynamic_shapes = True
         torch._inductor.config.triton.unique_kernel_names = True
         torch._inductor.config.coordinate_descent_tuning = True
-        generate_base.next_token = torch.compile(generate_base.next_token, mode="reduce-overhead")
 
     L.seed_everything(1234)
     for i in range(num_samples):
