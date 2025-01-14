@@ -380,6 +380,9 @@ class MostRecentKVCache(KVCache):
         self.v = self.v.to(value.dtype)
         self.k[:eff_batch_size, :, :init_length, :] = key
         self.v[:eff_batch_size, :, :init_length, :] = value
+        self.token_pos[:init_length] = torch.arange(
+            init_length, dtype=self.token_pos.dtype, device=self.token_pos.device
+        )
         self.current_length = init_length
         self._next_token_pos = init_length
         self.next_position = init_length % self.cache_length
