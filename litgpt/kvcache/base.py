@@ -1,4 +1,4 @@
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 from dataclasses import dataclass
 
 import torch
@@ -111,12 +111,24 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
+    def update_requires_attn_weights(self) -> bool:
+        """
+        Returns:
+            If `True`, :meth:`update` requires aergument `attn_weights`, which
+            passes current attention weights as
+            `(eff_batch_size, n_query_groups,T)` tensor, where `T <= cache_length`
+            is the current cache length
+
+        """
+        return False
+
     @property
     def max_prefill_length(self) -> int:
         """
         Returns:
             Maximum sequence length for `key`, `value` tensors passed to
             :meth:`prefill`.
+
         """
         raise NotImplementedError()
 
@@ -154,7 +166,7 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
-    def size_estimate(self) -> int:
+    def size_estimate(self) -> Tuple[int, Dict[str, int]]:
         """
         This is a theoretical estimate of the main buffers (which should all
         be allocated up front), it does not cover temporary storage used in
@@ -162,12 +174,12 @@ class KVCache(torch.nn.Module):
         Also, real memory usage may be larger due to alignment issues.
 
         Returns:
-            Estimate of number of bits the KV cache occupies in memory.
+            num_bits_total, bits_by_part (unit is bit)
         """
         raise NotImplementedError()
 
     @staticmethod
-    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
         """
         Same semantics as :meth:`size_estimate`, but can be called without a
         cache being created. Results may not be exactly the same, but should
@@ -178,7 +190,7 @@ class KVCache(torch.nn.Module):
             **kwargs: Extra arguments (optional)
 
         Returns:
-            Estimate of number of bits the KV cache will occupy in memory.
+            num_bits_total, bits_by_part (unit is bit)
         """
         raise NotImplementedError()
 
@@ -280,11 +292,12 @@ class DenseKVCache(KVCache):
             1, 1, -1
         ).expand(self.eff_batch_size, self.n_query_groups, -1)
 
-    def size_estimate(self) -> int:
-        return bitsize_of(self.k) + bitsize_of(self.v)
+    def size_estimate(self) -> Tuple[int, Dict[str, int]]:
+        sz_buffs = bitsize_of(self.k) + bitsize_of(self.v)
+        return sz_buffs, dict(buffers=sz_buffs)
 
     @staticmethod
-    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
         max_sequence_length = kwargs.get("max_sequence_length")
         if max_sequence_length is None:
             raise IndexError("Argument 'max_sequence_length' is missing")
@@ -294,7 +307,8 @@ class DenseKVCache(KVCache):
         if dtype is None:
             raise ValueError("params.dtype must be provided")
         numel = params.batch_size * params.n_query_groups * max_sequence_length * params.head_size
-        return 2 * numel * bits_for_torch_dtype(dtype)
+        sz_buffs = 2 * numel * bits_for_torch_dtype(dtype)
+        return sz_buffs, dict(buffers=sz_buffs)
 
 
 class MostRecentKVCache(KVCache):
@@ -393,11 +407,13 @@ class MostRecentKVCache(KVCache):
             self.eff_batch_size, self.n_query_groups, -1
         )
 
-    def size_estimate(self) -> int:
-        return bitsize_of(self.k) + bitsize_of(self.v) + bitsize_of(self.token_pos)
+    def size_estimate(self) -> Tuple[int, Dict[str, int]]:
+        sz_buffs = bitsize_of(self.k) + bitsize_of(self.v)
+        sz_pos = bitsize_of(self.token_pos)
+        return sz_buffs + sz_pos, dict(buffers=sz_buffs, token_pos=sz_pos)
 
     @staticmethod
-    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> int:
+    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
         cache_length = kwargs.get("cache_length")
         if cache_length is None:
             raise IndexError("Argument 'cache_length' is missing")
@@ -409,4 +425,4 @@ class MostRecentKVCache(KVCache):
         numel = params.batch_size * params.n_query_groups * cache_length * params.head_size
         k_and_v = 2 * numel * bits_for_torch_dtype(dtype)
         tk_p = cache_length * bits_for_torch_dtype(torch.int)
-        return k_and_v + tk_p
+        return k_and_v + tk_p, dict(buffers=k_and_v, token_pos=tk_p)

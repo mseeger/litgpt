@@ -20,7 +20,6 @@ from litgpt.kvcache import (
     KVCache,
     DenseKVCache,
     KVCacheParams,
-    AttnWeightsKVCache,
 )
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
@@ -570,7 +569,7 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        return_scores = input_pos is not None and isinstance(self.kv_cache, AttnWeightsKVCache)
+        return_scores = input_pos is not None and self.kv_cache.update_requires_attn_weights()
         y, scores = self.scaled_dot_product_attention(
             q, k, v, mask, is_causal, return_scores
         )
