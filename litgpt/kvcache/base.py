@@ -178,8 +178,8 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
-    @staticmethod
-    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
+    @classmethod
+    def size_estimate_apriori(cls, params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
         """
         Same semantics as :meth:`size_estimate`, but can be called without a
         cache being created. Results may not be exactly the same, but should
@@ -296,8 +296,8 @@ class DenseKVCache(KVCache):
         sz_buffs = bitsize_of(self.k) + bitsize_of(self.v)
         return sz_buffs, dict(buffers=sz_buffs)
 
-    @staticmethod
-    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
+    @classmethod
+    def size_estimate_apriori(cls, params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
         max_sequence_length = kwargs.get("max_sequence_length")
         if max_sequence_length is None:
             raise IndexError("Argument 'max_sequence_length' is missing")
@@ -412,8 +412,8 @@ class MostRecentKVCache(KVCache):
         sz_pos = bitsize_of(self.token_pos)
         return sz_buffs + sz_pos, dict(buffers=sz_buffs, token_pos=sz_pos)
 
-    @staticmethod
-    def size_estimate_apriori(params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
+    @classmethod
+    def size_estimate_apriori(cls, params: KVCacheParams, **kwargs) -> Tuple[int, Dict[str, int]]:
         cache_length = kwargs.get("cache_length")
         if cache_length is None:
             raise IndexError("Argument 'cache_length' is missing")
