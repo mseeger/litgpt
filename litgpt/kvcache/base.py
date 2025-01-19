@@ -34,6 +34,43 @@ class KVCacheParams:
         )
 
 
+class KeysAndValues:
+    """
+    Object returned by :meth:`KVCache.forward`. Allows to access cached
+    keys or values, but not both at the same time. Implementations may use the
+    same buffer to return them in the methods below.
+
+    """
+    def keys(self) -> torch.Tensor:
+        """
+        Returns:
+            keys tensor from :meth:`KVCache.forward`, shape
+            `(eff_batch_size, n_query_groups, T, head_size)`, where
+            `T <= cache_length` is the current cache length)
+
+        """
+        raise NotImplementedError()
+
+    def values(self) -> torch.Tensor:
+        """
+         Returns:
+             values tensor from :meth:`KVCache.forward`, shape
+             `(eff_batch_size, n_query_groups, T, head_size)`, where
+             `T <= cache_length` is the current cache length)
+
+         """
+        raise NotImplementedError()
+
+    @staticmethod
+    def both_in_parallel() -> bool:
+        """
+        Returns:
+            Can use both `keys` and `values` in parallel? Otherwise, can only
+            use one of them at the same time
+        """
+        return False
+
+
 class KVCache(torch.nn.Module):
     """
     Base class for key-value caches.
@@ -79,7 +116,7 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
-    def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         """
         Accepts key and value tensors for new token position. These are written
         into the cache. If the cache is full, they overwrite the slot for a
@@ -116,7 +153,7 @@ class KVCache(torch.nn.Module):
         Returns:
             If `True`, :meth:`update` requires aergument `attn_weights`, which
             passes current attention weights as
-            `(eff_batch_size, n_query_groups,T)` tensor, where `T <= cache_length`
+            `(eff_batch_size, n_query_groups, T)` tensor, where `T <= cache_length`
             is the current cache length
 
         """
@@ -195,6 +232,23 @@ class KVCache(torch.nn.Module):
         raise NotImplementedError()
 
 
+class DefaultKeysAndValues(KeysAndValues):
+    def __init__(self, keys: torch.Tensor, values: torch.Tensor):
+        assert keys.shape == values.shape and keys.ndim == 4
+        self._keys = keys
+        self._values = values
+
+    def keys(self) -> torch.Tensor:
+        return self._keys
+
+    def values(self) -> torch.Tensor:
+        return self._values
+
+    @staticmethod
+    def both_in_parallel() -> bool:
+        return True
+
+
 class DenseKVCache(KVCache):
     """
     Key-value cache for dense attention. Key and value tensors for all
@@ -240,7 +294,7 @@ class DenseKVCache(KVCache):
     def max_prefill_length(self) -> int:
         return self.cache_length
 
-    def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         if self.next_position is None:
             raise IndexError("Cache needs to be initialized with 'prefill' before being used")
         if self.next_position >= self.cache_length:
@@ -259,7 +313,7 @@ class DenseKVCache(KVCache):
         self.k[:self.eff_batch_size, :, self.next_position, :] = key
         self.v[:self.eff_batch_size, :, self.next_position, :] = value
         self.next_position += 1
-        return (
+        return DefaultKeysAndValues(
             self.k[:self.eff_batch_size, :, :self.next_position, :],
             self.v[:self.eff_batch_size, :, :self.next_position, :],
         )
@@ -353,7 +407,7 @@ class MostRecentKVCache(KVCache):
     def max_prefill_length(self) -> int:
         return self.cache_length
 
-    def forward(self, key: torch.Tensor, value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         if self.next_position is None:
             raise IndexError("Cache needs to be initialized with 'prefill' before being used")
         shape = (self.eff_batch_size, self.n_query_groups, self.head_size)
@@ -369,7 +423,7 @@ class MostRecentKVCache(KVCache):
         self.next_position = (self.next_position + 1) % self.cache_length
         self.current_length = min(self.current_length + 1, self.cache_length)
         self._next_token_pos += 1
-        return (
+        return DefaultKeysAndValues(
             self.k[:self.eff_batch_size, :, :self.current_length, :],
             self.v[:self.eff_batch_size, :, :self.current_length, :],
         )

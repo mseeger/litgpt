@@ -17,8 +17,10 @@ from typing_extensions import Self
 
 from litgpt.config import Config
 from litgpt.kvcache import (
-    KVCache,
+    DefaultKeysAndValues,
     DenseKVCache,
+    KeysAndValues,
+    KVCache,
     KVCacheParams,
 )
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
@@ -516,14 +518,14 @@ class CausalSelfAttention(nn.Module):
         # embedding size (C) into num_heads (nh) and head_size (hs).
         q = q.view(B, T, n_head, head_size)  # (B, T, nh_q, hs)
         k = k.view(B, T, n_query_groups, head_size)  # (B, T, nh_k, hs)
-        v = v.view(B, T, n_query_groups, head_size)  # (B, T, nh_v, hs)
+        v = v.view(B, T, n_query_groups, head_size)  # (B, T, nh_k, hs)
 
         # The tensors `query`, `key`, and `value` are now accurately structured: within each batch element (B), there are
         # multiple heads (nh), and within each head, there is a sequence of elements (T), each represented by a vector
         # of size `hs`.
         q = q.transpose(1, 2)  # (B, nh_q, T, hs)
         k = k.transpose(1, 2)  # (B, nh_k, T, hs)
-        v = v.transpose(1, 2)  # (B, nh_v, T, hs)
+        v = v.transpose(1, 2)  # (B, nh_k, T, hs)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
         if rope_n_elem > 0:
@@ -534,19 +536,13 @@ class CausalSelfAttention(nn.Module):
 
         if input_pos is not None:
             # Extend KV cache and retrieve key, value tensors to be used
-            k, v = self.kv_cache(k.squeeze(-2), v.squeeze(-2))
+            k_and_v = self.kv_cache(k.squeeze(-2), v.squeeze(-2))
             # k, v: (B, nh_k, cache_length, hs)
-        elif for_prefill:
-            # Prefill KV cache
-            self.kv_cache.prefill(key=k, value=v)
-
-        # Grouped queries: balance the number of heads across all three matrices.
-        # NOTE: flash attention requires it in training mode.
-        # Multi-query: this step can be skipped since there is only 1 head, allowing us to use broadcasting.
-        if n_query_groups != n_head and (input_pos is None or n_query_groups != 1):
-            q_per_kv = n_head // n_query_groups
-            k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, *, hs)
-            v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, *, hs)
+        else:
+            if for_prefill:
+                # Prefill KV cache
+                self.kv_cache.prefill(key=k, value=v)
+            k_and_v = DefaultKeysAndValues(k, v)
 
         # In general, we don't need an attention mask. If `input_pos` is not
         # given, we use causal masking with `is_causal=True`. Otherwise,
@@ -571,7 +567,7 @@ class CausalSelfAttention(nn.Module):
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
         return_scores = input_pos is not None and self.kv_cache.update_requires_attn_weights()
         y, scores = self.scaled_dot_product_attention(
-            q, k, v, mask, is_causal, return_scores
+            q, k_and_v, mask, is_causal, return_scores
         )
 
         if return_scores:
@@ -588,8 +584,7 @@ class CausalSelfAttention(nn.Module):
     def scaled_dot_product_attention(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k_and_v: KeysAndValues,
         mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
         return_scores: bool = False,
@@ -598,11 +593,10 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
 
         # with softcapping we cannot use SDPA
-        if return_scores or self.config.attention_logit_softcapping is not None:
+        if return_scores or self.config.attention_logit_softcapping is not None or not k_and_v.both_in_parallel():
             y, scores = scaled_dot_product_attention(
                 query=q,
-                key=k,
-                value=v,
+                k_and_v=k_and_v,
                 scale=scale,
                 mask=mask,
                 attention_logit_softcapping=self.config.attention_logit_softcapping,
@@ -612,9 +606,9 @@ class CausalSelfAttention(nn.Module):
                 scores = None
         else:
             y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
+                query=q,
+                key=k_and_v.keys(),
+                value=k_and_v.values(),
                 attn_mask=mask,
                 dropout_p=0.0,
                 scale=scale,
@@ -724,24 +718,36 @@ class LLaMAMoE(nn.Module):
 
 def scaled_dot_product_attention(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    k_and_v: KeysAndValues,
     scale: float,
     mask: Optional[torch.Tensor] = None,
     attention_logit_softcapping: Optional[float] = None,
     is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     dtype = query.dtype
+    assert query.ndim == 4
+    _, nh_q, T, _ = query.shape
+    key = k_and_v.keys()
+    nh_k = key.shape[1]
+    q_per_kv = nh_q // nh_k
+    assert nh_q == nh_k * q_per_kv
+    if q_per_kv > 1:
+        # TODO: Can we avoid this? Will create new large tensor
+        key = key.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
     scores = query @ key.mT * scale
     scores = do_softcapping(scores, attention_logit_softcapping)
     if mask is None and is_causal:
-        T = query.size(2)
         assert key.size(2) == T, "is_causal=True only if query, key have same size"
         mask = torch.ones(T, T, dtype=dtype, device=query.device).triu(diagonal=1)
         mask.masked_fill_(mask.bool(), torch.finfo(query.dtype).min)
+        mask = mask.view(1, 1, T, T)
     if mask is not None:
         scores = scores + mask
     scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)
+    value = k_and_v.values()
+    if q_per_kv > 1:
+        # TODO: Can we avoid this? Will create new large tensor
+        value = value.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
     return scores @ value, scores
 
 
