@@ -716,6 +716,57 @@ class LLaMAMoE(nn.Module):
         return y.view(B, T, C)
 
 
+def _attention_compute_scores(
+    query: torch.Tensor,
+    key: torch.Tensor,
+) -> torch.Tensor:
+    # - query: (bs, nh_q, T_q, hs)
+    # - key: (bs, nh_k, T_k, hs)
+    nh_q = query.shape[1]
+    nh_k = key.shape[1]
+    q_per_kv = nh_q // nh_k
+    assert nh_q == nh_k * q_per_kv
+    key_transposed = key.mT  # (bs, nh_k, hs, T_k)
+    if q_per_kv == 1:
+        return query @ key_transposed
+    else:
+        assert q_per_kv > 1
+        q_shape = query.shape[:1] + (q_per_kv, nh_k) + query.shape[2:]
+        query = query.view(*q_shape)
+        key_transposed = key_transposed.unsqueeze(1)
+        # At this point:
+        # - query: (bs, q_per_kv, nh_k, T_q, hs)
+        # - key_transposed: (bs, 1, nh_k, hs, T_k)
+        # - scores: (bs, q_per_kv, nh_k, T_q, T_k)
+        scores = torch.matmul(query, key_transposed)
+        s_shape = query.shape[:-1] + (key.shape[2],)
+        return scores.view(*s_shape)
+
+
+def _attention_compute_weighted_values(
+    scores: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    # - scores: (bs, nh_q, T_q, T_k)
+    # - value: (bs, nh_k, T_k, hs)
+    nh_q = scores.shape[1]
+    nh_k = value.shape[1]
+    q_per_kv = nh_q // nh_k
+    if q_per_kv == 1:
+        return scores @ value
+    else:
+        s_shape = scores.shape[:1] + (q_per_kv, nh_k) + scores.shape[2:]
+        scores = scores.view(*s_shape)
+        value = value.unsqueeze(1)
+        # At this point:
+        # - scores: (bs, q_per_kv, nh_k, T_q, T_k)
+        # - value: (bs, 1, nh_k, T_k, hs)
+        # - result: (bs, q_per_kv, nh_k, T_q, hs)
+        result = torch.matmul(scores, value)
+        r_shape = scores.shape[:-2] + value.shape[-2:]
+        return result.view(*r_shape)
+
+
 def scaled_dot_product_attention(
     query: torch.Tensor,
     k_and_v: KeysAndValues,
@@ -725,18 +776,11 @@ def scaled_dot_product_attention(
     is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     dtype = query.dtype
-    assert query.ndim == 4
-    _, nh_q, T, _ = query.shape
     key = k_and_v.keys()
-    nh_k = key.shape[1]
-    q_per_kv = nh_q // nh_k
-    assert nh_q == nh_k * q_per_kv
-    if q_per_kv > 1:
-        # TODO: Can we avoid this? Will create new large tensor
-        key = key.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
-    scores = query @ key.mT * scale
+    scores = _attention_compute_scores(query, key) * scale
     scores = do_softcapping(scores, attention_logit_softcapping)
     if mask is None and is_causal:
+        T = query.shape[2]
         assert key.size(2) == T, "is_causal=True only if query, key have same size"
         mask = torch.ones(T, T, dtype=dtype, device=query.device).triu(diagonal=1)
         mask.masked_fill_(mask.bool(), torch.finfo(query.dtype).min)
@@ -744,11 +788,7 @@ def scaled_dot_product_attention(
     if mask is not None:
         scores = scores + mask
     scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)
-    value = k_and_v.values()
-    if q_per_kv > 1:
-        # TODO: Can we avoid this? Will create new large tensor
-        value = value.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
-    return scores @ value, scores
+    return _attention_compute_weighted_values(scores, k_and_v.values()), scores
 
 
 def build_rope_cache(
