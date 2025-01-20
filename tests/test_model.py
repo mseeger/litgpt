@@ -3,6 +3,8 @@
 from copy import deepcopy
 from functools import partial
 from unittest import mock
+import math
+import random
 
 import pytest
 import torch
@@ -32,7 +34,8 @@ from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 
 import litgpt.config as config_module
 from litgpt import GPT, Config
-from litgpt.model import CausalSelfAttention
+from litgpt.kvcache.base import DefaultKeysAndValues
+from litgpt.model import CausalSelfAttention, scaled_dot_product_attention
 from litgpt.utils import batched_index_copy_
 from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_falcon,
@@ -1368,20 +1371,62 @@ def test_rope_cos_sin_shapes_if_rope_n_elem_is_odd(rotary_percentage, final_dim)
     assert model.cos.shape == required_shape
     assert model.sin.shape == required_shape
 
-def test_forward_with_without_input_pos_maxp1():
-    batch_size = 3
-    config = Config(
-        block_size=25,
-        padded_vocab_size=5,
-        n_layer=2,
-        n_head=8,
-        n_embd=16,
-    )
-    model = GPT(config)
-    model.set_kv_cache(batch_size)
-    idx = torch.randint(0, config.padded_vocab_size, (1, 10))
-    input_pos = torch.arange(1, 11)
-    input_pos_maxp1 = torch.tensor(11)
-    logits_with_maxp1 = model(idx, input_pos, input_pos_maxp1=input_pos_maxp1)
-    logits_no_maxp1 = model(idx, input_pos)
-    torch.testing.assert_close(logits_with_maxp1, logits_no_maxp1)
+
+@pytest.mark.parametrize(
+    ("n_head", "n_query_groups"),
+    (
+        (2, 1),
+        (4, 1),
+        (8, 4),
+        (12, 4),
+        (24, 8),
+        (9, 3),
+    ),
+)
+@torch.inference_mode()
+def test_scaled_dot_product_attention(n_head, n_query_groups):
+    seed = 31415927
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    num_repeats = 5
+    dtype = torch.bfloat16
+
+    for repeat in range(num_repeats):
+        head_size = 2 ** random.randint(3, 6)
+        batch_size = random.randint(1, 5)
+        len_key = random.randint(16, 128)
+        is_causal = repeat % 2 == 0
+        if is_causal:
+            len_query = len_key
+        elif repeat % 4 == 1:
+            len_query = random.randint(1, len_key // 2)
+        else:
+            len_query = 1
+        shape = (batch_size, n_head, len_query, head_size)
+        query = torch.randn(shape, dtype=dtype)
+        shape = (batch_size, n_query_groups, len_key, head_size)
+        key = torch.randn(shape, dtype=dtype)
+        value = torch.randn(shape, dtype=dtype)
+        k_and_v = DefaultKeysAndValues(key, value)
+        scale = 1.0 / math.sqrt(head_size)
+
+        result, scores = scaled_dot_product_attention(
+            query,
+            k_and_v,
+            scale=scale,
+            is_causal=is_causal,
+        )
+        q_per_kv = n_head // n_query_groups
+        key_bc = key.repeat_interleave(q_per_kv, dim=1)
+        value_bc = value.repeat_interleave(q_per_kv, dim=1)
+        k_and_v_bc = DefaultKeysAndValues(key_bc, value_bc)
+        result_cmp, scores_cmp = scaled_dot_product_attention(
+            query,
+            k_and_v_bc,
+            scale=scale,
+            is_causal=is_causal,
+        )
+        msg = f"bs={batch_size}, hs={head_size}, nh_q={n_head}, nh_k={n_query_groups}, len_q={len_query}, len_k={len_key}"
+        kwargs = dict(atol=0.0005, rtol=0.05)
+        torch.testing.assert_close(result, result_cmp, **kwargs), msg
+        torch.testing.assert_close(scores, scores_cmp, **kwargs), msg

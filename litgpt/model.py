@@ -521,8 +521,11 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, n_query_groups, head_size)  # (B, T, nh_k, hs)
 
         # The tensors `query`, `key`, and `value` are now accurately structured: within each batch element (B), there are
-        # multiple heads (nh), and within each head, there is a sequence of elements (T), each represented by a vector
+        # multiple heads (nh_q), and within each head, there is a sequence of elements (T), each represented by a vector
         # of size `hs`.
+        # Note that `nh_k` can be smaller than `nh_q` (but the latter must be a
+        # multiple of the former). This works with the
+        # `scaled_dot_product_attention` implementations below.
         q = q.transpose(1, 2)  # (B, nh_q, T, hs)
         k = k.transpose(1, 2)  # (B, nh_k, T, hs)
         v = v.transpose(1, 2)  # (B, nh_k, T, hs)
@@ -535,22 +538,28 @@ class CausalSelfAttention(nn.Module):
             k = torch.cat((k_roped, k[..., rope_n_elem :]), dim=-1)  # (B, nh_k, T, hs)
 
         if input_pos is not None:
-            # Extend KV cache and retrieve key, value tensors to be used
+            # Extend KV cache and retrieve key, value tensors to be used.
+            # Instead of asking for the key and value tensors as such,
+            # `k_and_v` allows access to them. Since they are never needed at
+            # the same time, this can save memory.
             k_and_v = self.kv_cache(k.squeeze(-2), v.squeeze(-2))
             # k, v: (B, nh_k, cache_length, hs)
         else:
             if for_prefill:
                 # Prefill KV cache
                 self.kv_cache.prefill(key=k, value=v)
+            # In this case, `k_and_v` can vend both keys and values at the same
+            # time.
             k_and_v = DefaultKeysAndValues(k, v)
 
         # In general, we don't need an attention mask. If `input_pos` is not
         # given, we use causal masking with `is_causal=True`. Otherwise,
-        # generative attention is causal without masking.
+        # generative attention is causal anyway, no need for a mask.
         is_causal = input_pos is None
         mask = None
         if self.apply_sliding_window_attention:
-            # Special case requires building a mask
+            # Special case requires building a mask. `mask_cache` is only needed
+            # then.
             assert mask_cache is not None, "mask_cache must be given if sliding window attention is used"
             if is_causal:
                 mask = mask_cache[:T, :T].view(1, 1, T, T)
@@ -605,6 +614,9 @@ class CausalSelfAttention(nn.Module):
             if not return_scores:
                 scores = None
         else:
+            # We need `key` and `value` at the same time here. For the training
+            # use case, this will be the case, since `k_and_v` is the default
+            # in this case.
             y = F.scaled_dot_product_attention(
                 query=q,
                 key=k_and_v.keys(),
@@ -731,14 +743,14 @@ def _attention_compute_scores(
         return query @ key_transposed
     else:
         assert q_per_kv > 1
-        q_shape = query.shape[:1] + (q_per_kv, nh_k) + query.shape[2:]
-        query = query.view(*q_shape)
-        key_transposed = key_transposed.unsqueeze(1)
+        q_shape = query.shape[:1] + (nh_k, q_per_kv) + query.shape[2:]
+        _query = query.view(*q_shape)
+        key_transposed = key_transposed.unsqueeze(2)
         # At this point:
-        # - query: (bs, q_per_kv, nh_k, T_q, hs)
-        # - key_transposed: (bs, 1, nh_k, hs, T_k)
-        # - scores: (bs, q_per_kv, nh_k, T_q, T_k)
-        scores = torch.matmul(query, key_transposed)
+        # - query: (bs, nh_k, q_per_kv, T_q, hs)
+        # - key_transposed: (bs, nh_k, 1, hs, T_k)
+        # - scores: (bs, nh_k, q_per_kv, T_q, T_k)
+        scores = torch.matmul(_query, key_transposed)
         s_shape = query.shape[:-1] + (key.shape[2],)
         return scores.view(*s_shape)
 
@@ -755,15 +767,15 @@ def _attention_compute_weighted_values(
     if q_per_kv == 1:
         return scores @ value
     else:
-        s_shape = scores.shape[:1] + (q_per_kv, nh_k) + scores.shape[2:]
-        scores = scores.view(*s_shape)
-        value = value.unsqueeze(1)
+        s_shape = scores.shape[:1] + (nh_k, q_per_kv) + scores.shape[2:]
+        _scores = scores.view(*s_shape)
+        _value = value.unsqueeze(2)
         # At this point:
-        # - scores: (bs, q_per_kv, nh_k, T_q, T_k)
-        # - value: (bs, 1, nh_k, T_k, hs)
-        # - result: (bs, q_per_kv, nh_k, T_q, hs)
-        result = torch.matmul(scores, value)
-        r_shape = scores.shape[:-2] + value.shape[-2:]
+        # - scores: (bs, nh_k, q_per_kv, T_q, T_k)
+        # - value: (bs, nh_k, 1, T_k, hs)
+        # - result: (bs, nh_k, q_per_kv, T_q, hs)
+        result = torch.matmul(_scores, _value)
+        r_shape = scores.shape[:-1] + (value.shape[-1],)
         return result.view(*r_shape)
 
 
