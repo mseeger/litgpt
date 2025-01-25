@@ -11,26 +11,28 @@ from litgpt.kvcache.utils import bitsize_of, bits_for_torch_dtype
 class KVCacheParams:
     batch_size: int
     n_query_groups: int
+    cache_length: int
     head_size: int
     n_head: int
     device: Optional[torch.device]
     dtype: Optional[torch.dtype]
-    max_prefill_length: int
 
     @staticmethod
     def from_config(
         config: Config,
-        batch_size: Optional[int] = None,
-        max_prefill_length: Optional[int] = None,
+        batch_size: int,
+        cache_length: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> "KVCacheParams":
         return KVCacheParams(
             batch_size=batch_size,
-            n_query_groups = config.n_query_groups,
-            head_size = config.n_embd // config.n_head,
-            n_head = config.n_head,
-            device=None,
-            dtype=None,
-            max_prefill_length=max_prefill_length,
+            n_query_groups=config.n_query_groups,
+            cache_length=cache_length,
+            head_size=config.n_embd // config.n_head,
+            n_head=config.n_head,
+            device=device,
+            dtype=dtype,
         )
 
 
@@ -73,11 +75,21 @@ class KeysAndValues:
 
 class KVCache(torch.nn.Module):
     """
-    Base class for key-value caches.
+    Base class for key-value (KV) caches.
 
     Buffers have shapes
     `(batch_size, config.n_query_groups, cache_length, head_size)`, where
-    `head_size = config.n_embed // config.n_head`.
+    `head_size = config.n_embed // config.n_head`. Caching can be used for
+    batch size `1 <= eff_batch_size <= batch_size`, which is determined in
+    the :meth:`prefill` call.
+
+    A KV cache is used as follows. First, the buffer is prefilled by calling
+    :meth:`prefill`, which also determines the effective batch size
+    `eff_batch_size`. Then, new KV information is added sequentially by calling
+    :meth:`forward`. The information can be for one or more tokens, up to
+    `max_tokens_forward`. For most caches, :meth:`update` needs to be called
+    after each :meth:`forward`, passing extra information. See for example
+    :meth:`update_requires_attn_weights`.
 
     Note: In general, key tensors need to be position-encoded.
     """
@@ -85,6 +97,7 @@ class KVCache(torch.nn.Module):
         self,
         config: Config,
         batch_size: int,
+        cache_length: int,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -96,12 +109,16 @@ class KVCache(torch.nn.Module):
         Args:
             config: Model config
             batch_size: Inference batch size (maximum)
+            cache_length: Number of slots in cache
             device: Device for buffers
             dtype: Data type for buffers
         """
         super().__init__()
+        if cache_length <= 0:
+            raise ValueError("cache_length must be positive")
         self.batch_size = batch_size
         self.n_query_groups = config.n_query_groups
+        self.cache_length = cache_length
         self.head_size = config.n_embd // config.n_head
         self.n_head = config.n_head
         self.device = device
@@ -116,16 +133,34 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
+    @property
+    def max_tokens_forward(self) -> int:
+        """
+        Returns:
+            Maximum number of token positions which can be treated in
+            :meth:`forward`. Depends on cache, but is `<= cache_length`
+
+        """
+        raise NotImplementedError()
+
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         """
-        Accepts key and value tensors for new token position. These are written
-        into the cache. If the cache is full, they overwrite the slot for a
-        token which is evicted. In general, the eviction decision is taken in
-        the last recent call of :meth:`update`.
+        Accepts key and value tensors for `1 <= num <= max_tokens_forward`
+        new token positions. These are written into the cache. If the cache
+        is full, they overwrite slots for tokens to be evicted. In general,
+        the eviction decision is taken in the last recent call of :meth:`update`.
+
+        If a sequence is generated token by token, this method is always called
+        with `num=1`. The case `num > 1` arises if large prompts are to be
+        ingested with more than `max_prefill_length` tokens. Note that if the
+        cache makes eviction decisions by scoring in :meth:`update`, then large
+        `num` may lead to worse decisions. On the other hand, ingesting the
+        prompt with larger `num` is faster.
 
         Args:
-            key: New keys, `(eff_batch_size, n_query_groups, head_size)`
-            value: New values, `(eff_batch_size, n_query_groups, head_size)`
+            key: New keys, `(eff_batch_size, n_query_groups, num, head_size)`,
+                where `1 <= num <= max_tokens_forward`
+            value: New values, `(eff_batch_size, n_query_groups, num, head_size)`
 
         Returns:
             key_cached, value_cached, `(eff_batch_size, n_query_groups, T,
@@ -140,7 +175,10 @@ class KVCache(torch.nn.Module):
         Some caches require this method to be called after each `forward`,
         passing extra information depending on the subclass. In general,
         this method updates internal scores and takes a decision which slot
-        is evicted upon the next `forward` call (if the cache is full).
+        is evicted upon the next :meth:`forward` call (if the cache is full).
+
+        Note: The extra information typically scales with `num`, the number of
+        tokens :meth:`forward` was called for.
 
         Args:
             *args: Depends on subclass
@@ -151,10 +189,11 @@ class KVCache(torch.nn.Module):
     def update_requires_attn_weights(self) -> bool:
         """
         Returns:
-            If `True`, :meth:`update` requires aergument `attn_weights`, which
+            If `True`, :meth:`update` requires argument `attn_weights`, which
             passes current attention weights as
-            `(eff_batch_size, n_query_groups, T)` tensor, where `T <= cache_length`
-            is the current cache length
+            `(eff_batch_size, n_query_groups, num, T)` tensor, where
+            `T <= cache_length` is the current cache length, and `num` is the
+            number of tokens in the last recent :meth:`forward` call.
 
         """
         return False
@@ -187,11 +226,11 @@ class KVCache(torch.nn.Module):
         return KVCacheParams(
             batch_size=self.batch_size,
             n_query_groups=self.n_query_groups,
+            cache_length=self.cache_length,
             head_size=self.n_head,
             n_head=self.n_head,
             device=self.device,
             dtype=self.dtype,
-            max_prefill_length=self.max_prefill_length,
         )
 
     def token_positions(self) -> torch.Tensor:
@@ -275,11 +314,15 @@ class DenseKVCache(KVCache):
             dtype: Data type for buffers
             max_sequence_length: Cache length. If not given, we use
             `config.block_size`
+            max_tokens_forward: See parent class
+
         """
-        super().__init__(config, batch_size, device, dtype)
         if max_sequence_length is None:
             max_sequence_length = config.block_size
-        self.cache_length = max_sequence_length
+
+        super().__init__(
+            config, batch_size, max_sequence_length, device, dtype
+        )
         shape = (batch_size, self.n_query_groups, max_sequence_length, self.head_size)
         self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
@@ -291,15 +334,23 @@ class DenseKVCache(KVCache):
         return self.next_position
 
     @property
+    def max_tokens_forward(self) -> int:
+        return self.cache_length
+
+    @property
     def max_prefill_length(self) -> int:
         return self.cache_length
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         if self.next_position is None:
             raise IndexError("Cache needs to be initialized with 'prefill' before being used")
-        if self.next_position >= self.cache_length:
-            raise IndexError("Cache is full, cannot add further content")
-        shape = (self.eff_batch_size, self.n_query_groups, self.head_size)
+        num = key.shape[2]
+        if not 1 <= num <= self.max_tokens_forward:
+            raise ValueError(f"key.shape[2] = {num}, must be in [1, {self.max_tokens_forward}]")
+        np = self.next_position
+        if np + num > self.cache_length:
+            raise IndexError(f"Cache has at most {self.cache_length - np} free slots, cannot add {num} entries")
+        shape = (self.eff_batch_size, self.n_query_groups, num, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         if key.dtype != value.dtype:
@@ -310,9 +361,9 @@ class DenseKVCache(KVCache):
             self.k = self.k.to(self.dtype)
             self.v = self.v.to(self.dtype)
         # Append new content to cache
-        self.k[:self.eff_batch_size, :, self.next_position, :] = key
-        self.v[:self.eff_batch_size, :, self.next_position, :] = value
-        self.next_position += 1
+        self.k[:self.eff_batch_size, :, np:(np + num), :] = key
+        self.v[:self.eff_batch_size, :, np:(np + num), :] = value
+        self.next_position += num
         return DefaultKeysAndValues(
             self.k[:self.eff_batch_size, :, :self.next_position, :],
             self.v[:self.eff_batch_size, :, :self.next_position, :],
@@ -385,11 +436,10 @@ class MostRecentKVCache(KVCache):
             cache_length: Number of slots of cache
             device: Device for buffers
             dtype: Data type for buffers
-        """
-        super().__init__(config, batch_size, device, dtype)
-        if cache_length <= 0:
-            raise ValueError("cache_length must be positive")
-        self.cache_length = cache_length
+    """
+        super().__init__(
+            config, batch_size, cache_length, device, dtype
+        )
         shape = (batch_size, self.n_query_groups, cache_length, self.head_size)
         self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
@@ -404,25 +454,44 @@ class MostRecentKVCache(KVCache):
         return self._next_token_pos
 
     @property
+    def max_tokens_forward(self) -> int:
+        return self.cache_length
+
+    @property
     def max_prefill_length(self) -> int:
         return self.cache_length
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         if self.next_position is None:
             raise IndexError("Cache needs to be initialized with 'prefill' before being used")
-        shape = (self.eff_batch_size, self.n_query_groups, self.head_size)
+        num = key.shape[2]
+        if not 1 <= num <= self.max_tokens_forward:
+            raise ValueError(f"key.shape[2] = {num}, must be in [1, {self.max_tokens_forward}]")
+        shape = (self.eff_batch_size, self.n_query_groups, num, self.head_size)
         if key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         # Move the buffer to the activation dtype for when AMP is used
         self.k = self.k.to(key.dtype)
         self.v = self.v.to(value.dtype)
         # Append new content to cache
-        self.k[:self.eff_batch_size, :, self.next_position, :] = key
-        self.v[:self.eff_batch_size, :, self.next_position, :] = value
-        self.token_pos[self.next_position] = self._next_token_pos
-        self.next_position = (self.next_position + 1) % self.cache_length
-        self.current_length = min(self.current_length + 1, self.cache_length)
-        self._next_token_pos += 1
+        np = self.next_position
+        num1 = min(num, self.cache_length - np)
+        self.k[:self.eff_batch_size, :, np:(np + num1), :] = key[:, :, :num1, :]
+        self.v[:self.eff_batch_size, :, np:(np + num1), :] = value[:, :, :num1, :]
+        ntp = self._next_token_pos
+        self.token_pos[np:(np + num1)] = torch.arange(
+            ntp, ntp + num1, device=self.device, dtype=torch.int
+        )
+        if num1 < num:
+            diff = num - num1
+            self.k[:self.eff_batch_size, :, :diff, :] = key[:, :, num1:, :]
+            self.v[:self.eff_batch_size, :, :diff, :] = value[:, :, num1:, :]
+            self.token_pos[:diff] = torch.arange(
+                ntp + num1, ntp + num, device=self.device, dtype=torch.int
+            )
+        self.next_position = (np + num) % self.cache_length
+        self.current_length = min(self.current_length + num, self.cache_length)
+        self._next_token_pos += num
         return DefaultKeysAndValues(
             self.k[:self.eff_batch_size, :, :self.current_length, :],
             self.v[:self.eff_batch_size, :, :self.current_length, :],
