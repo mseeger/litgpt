@@ -209,9 +209,9 @@ def test_sample(temperature):
     )
     token = sample(logits, temperature=temperature, top_p=0.8)
 
-    assert token.shape == (1,)
+    assert token.shape == (2, 3)
     # sample is batch size 1 only for now - this should be [0, 1] once batched generation is supported
-    assert token.tolist() == [0]
+    assert token[0, -1].item() == 0
 
 
 def test_generate_different_results_with_different_top_p():

@@ -31,6 +31,7 @@ def generate(
     prompt: torch.Tensor,
     max_returned_tokens: int,
     *,
+    prompt_chunksize: int = 1,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     top_p: float = 1.0,
@@ -65,7 +66,8 @@ def generate(
         model=model,
         prompt=prompt,
         max_returned_tokens=max_returned_tokens,
-            sqmple_args = dict(
+        prompt_chunksize=prompt_chunksize,
+        sample_args = dict(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,

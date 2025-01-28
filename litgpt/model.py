@@ -113,11 +113,10 @@ class GPT(nn.Module):
                     max_sequence_length=value
                 )
         # Mask cache
-        sw_size = self.config.sliding_window_size
-        if sw_size is not None and (self.mask_cache is None or self.mask_cache.shape[-1] < value):
+        if self.mask_cache is None or self.mask_cache.shape[-1] < value:
             self.mask_cache = build_mask_cache(
                 value,
-                sliding_window_size=sw_size,
+                sliding_window_size=self.config.sliding_window_size,
                 device=self.cos.device,
             )
 
@@ -210,9 +209,10 @@ class GPT(nn.Module):
         - Inference, prefill: `input_pos=None`, `for_prefill=True`. Same as
           training, but KV cache is initialized with K and V vectors. If KV
           caches are not present, they are created here.
-        - Inference, token generation: `input_pos` given, `for_prefill` is
+        - Inference, token generation: `input_pos` given, `for_prefill`
           is ignored. KV caches must be given, they are used and updated. We
-          check that`input_pos == kv_cache.next_token_pos`.
+          check that`input_pos == kv_cache.next_token_pos`. Note that `T > 1`
+          is permitted here as well.
 
         Args:
             idx: Token indices of input sequences, shape `(B, T)`, where `B`
@@ -235,7 +235,7 @@ class GPT(nn.Module):
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
         if input_pos is not None:
-            # Single token generation. This needs a KV cache. If none is passed
+            # Few tokens generation. This needs a KV cache. If none is passed
             # at construction, the caches are created with the first call with
             # `for_prefill=True`.
             if T != 1:
@@ -246,10 +246,12 @@ class GPT(nn.Module):
                     raise ValueError(f"KV cache for layer {l_ix} is missing or not initialized. You need to start with pre-filling (for_prefill=True)")
                 if kv_cache.next_token_pos != input_pos:
                     raise ValueError(f"KV cache for layer {l_ix}: input_pos = {input_pos} != {self.kv_cache.next_token_pos} = kv_cache.next_token_pos")
+                if kv_cache.max_tokens_forward < T:
+                    raise ValueError(f"KV cache for layer {l_ix}: T = {T}, must be <= max_tokens_forward = {kv_cache.max_tokens_forward}")
             for_prefill = False
 
-            input_pos_array = torch.tensor([input_pos], device=self.cos.device)
             if self.config.rope_n_elem > 0:
+                input_pos_array = torch.arange(input_pos, input_pos + T, device=self.cos.device, dtype=torch.int64)
                 cos = batched_index_select(self.cos, 0, input_pos_array).unsqueeze(0)
                 sin = batched_index_select(self.sin, 0, input_pos_array).unsqueeze(0)
             else:
@@ -352,6 +354,13 @@ class GPT(nn.Module):
     def get_kv_cache_params(self) -> Optional[KVCacheParams]:
         kv_cache = self.transformer.h[0].attn.kv_cache
         return None if kv_cache is None else kv_cache.get_params()
+
+    def kv_cache_max_tokens_forward(self) -> Optional[int]:
+        caches = [layer.attn.kv_cache for layer in self.transformer.h]
+        if any(cache is None for cache in caches):
+            return None
+        else:
+            return min(cache.max_tokens_forward for cache in caches)
 
 
 class Block(nn.Module):
@@ -496,8 +505,9 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError("If input_pos is given, KV cache must exist and be initialized (call with for_prefill=True)")
             if self.kv_cache.next_token_pos != input_pos:
                 raise ValueError(f"input_pos = {input_pos} != {self.kv_cache.next_token_pos} = kv_cache.next_token_pos")
-            if T != 1:
-                raise ValueError(f"If input_pos is given, sequence length must be 1, but is {T}")
+            if self.kv_cache.max_tokens_forward < T:
+                raise ValueError(
+                    f"T = {T}, must be <= max_tokens_forward = {self.kv_cache.max_tokens_forward}")
             for_prefill = False
         elif for_prefill:
             if self.kv_cache is None:
@@ -542,7 +552,7 @@ class CausalSelfAttention(nn.Module):
             # Instead of asking for the key and value tensors as such,
             # `k_and_v` allows access to them. Since they are never needed at
             # the same time, this can save memory.
-            k_and_v = self.kv_cache(k.squeeze(-2), v.squeeze(-2))
+            k_and_v = self.kv_cache(k, v)
             # k, v: (B, nh_k, cache_length, hs)
         else:
             if for_prefill:
@@ -552,21 +562,26 @@ class CausalSelfAttention(nn.Module):
             # time.
             k_and_v = DefaultKeysAndValues(k, v)
 
-        # In general, we don't need an attention mask. If `input_pos` is not
-        # given, we use causal masking with `is_causal=True`. Otherwise,
-        # generative attention is causal anyway, no need for a mask.
+        # We need the attention mask if there is sliding window attention,
+        # or if `input_pos` is given and T > 1.
         is_causal = input_pos is None
+        use_mask = (
+            self.apply_sliding_window_attention is not None or
+            (not is_causal and T > 1)
+        )
         mask = None
-        if self.apply_sliding_window_attention:
+        if use_mask:
             # Special case requires building a mask. `mask_cache` is only needed
             # then.
-            assert mask_cache is not None, "mask_cache must be given if sliding window attention is used"
+            assert mask_cache is not None, "mask_cache must be given if sliding window attention is used, or if input_pos given and T > 1"
             if is_causal:
                 mask = mask_cache[:T, :T].view(1, 1, T, T)
                 is_causal = False
             else:
+                # We need a mask if T > 1, since inference needs to be causal
+                # for the new tokens
                 mask = batched_index_select(
-                    mask_cache[:, input_pos:(input_pos + 1)],
+                    mask_cache[:, input_pos:(input_pos + T)],
                     dim=0,
                     idx=self.kv_cache.token_positions(),
                 )
@@ -581,7 +596,6 @@ class CausalSelfAttention(nn.Module):
 
         if return_scores:
             # Pass attention weights to KV cache
-            scores = scores.squeeze(-2)
             self.kv_cache.update(attn_weights=scores)
 
         # Re-assemble all head outputs side by side.
@@ -927,7 +941,7 @@ def do_softcapping(x: torch.Tensor, thresh: Optional[float]) -> torch.Tensor:
 
 def build_mask_cache(
     max_seq_length: int,
-    sliding_window_size: int,
+    sliding_window_size: Optional[int],
     device: Optional[torch.device] = None
 ) -> torch.Tensor:
     """
@@ -940,11 +954,14 @@ def build_mask_cache(
     │ True True  True  True  │  │ False False True True │  │ False False True  True  │
     └────────────────────────┘  └───────────────────────┘  └─────────────────────────┘
     """
+    # Usual causal mask:
     mask = torch.ones(max_seq_length, max_seq_length, device=device).triu(diagonal=1)
     mask.masked_fill_(mask.bool(), float("-inf"))
-    sliding_window_bias = torch.ones_like(mask).tril(diagonal=-sliding_window_size)
-    sliding_window_bias.masked_fill_(sliding_window_bias.bool(), float("-inf"))
-    return mask + sliding_window_bias
+    if sliding_window_size is not None:
+        sliding_window_bias = torch.ones_like(mask).tril(diagonal=-sliding_window_size)
+        sliding_window_bias.masked_fill_(sliding_window_bias.bool(), float("-inf"))
+        mask += sliding_window_bias
+    return mask
 
 
 class RMSNorm(torch.nn.Module):

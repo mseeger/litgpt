@@ -31,12 +31,12 @@ def multinomial_num_samples_1(probs: torch.Tensor) -> torch.Tensor:
     if torch._dynamo.is_compiling():
         # Faster alternative to `torch.multinomial(probs, num_samples=1)` that is also CUDAGraph friendly
         distribution = torch.empty_like(probs).exponential_(1)
-        return torch.argmax(probs / distribution, dim=-1, keepdim=True)
-    return torch.multinomial(probs, num_samples=1)
+        return torch.argmax(probs / distribution, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 def sample_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-    sorted_logits, sorted_indices = torch.sort(logits, descending=False)
+    sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=False)
     cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
     # Example:
     # sorted_probs=[0.1, 0.15, 0.2, 0.25, 0.3] -> sorted_cumprobs=[0.1, 0.25, 0.45, 0.7, 1.0]
@@ -44,26 +44,38 @@ def sample_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
     sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
     # Keep at least 1 token always to prevent the case where no token is selected
     # In this case the most probable one is always kept
-    sorted_indices_to_remove[-1:] = 0
-    indices_to_remove = sorted_indices_to_remove.scatter(0, sorted_indices, sorted_indices_to_remove)
+    sorted_indices_to_remove[..., -1:] = 0
+    indices_to_remove = sorted_indices_to_remove.scatter(
+        -1, sorted_indices, sorted_indices_to_remove
+    )
     logits = logits.masked_fill(indices_to_remove, float("-inf"))
     return logits
 
 
 def sample(
-    logits: torch.Tensor, temperature: float = 1.0, top_k: Optional[int] = None, top_p: float = 1.0
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_k: Optional[int] = None,
+    top_p: float = 1.0,
 ) -> torch.Tensor:
-    if top_p < 0.0 or top_p > 1.0:
+    """
+    Args:
+        logits: Logits of sampling probabilities, (batch_size, num, n_vocab)
+        temperature: Sampling temperature, defaults to 1
+        top_k: Parameter for top-k sampling, defaults to None
+        top_p: Parameter for top-p sampling, defaults to 1
+
+    Returns:
+        Token indices, (batch_size, num)
+    """
+    if not (0.0 <= top_p <= 1.0):
         raise ValueError(f"top_p must be in [0, 1], got {top_p}")
-    if logits.dim() > 3:
-        raise ValueError(f"logits must have dim 2 or 3, got {logits.shape}")
-    elif logits.dim() == 2:
-        logits = logits[-1]
-    elif logits.dim() == 3:
-        logits = logits[0, -1]
+    if logits.dim() != 3:
+        raise ValueError(f"logits must have dim 3, got {logits.shape}")
+    # Now: logits has shape (batch_size, num, n_vocab)
     # optionally crop the logits to only the top k options
     if top_k is not None:
-        v, i = torch.topk(logits, min(top_k, logits.size(-1)))
+        v, i = torch.topk(logits, k=min(top_k, logits.size(-1)), dim=-1)
         # do not use `torch.where` as in nanogpt because it will repeat top-k collisions
         logits = torch.full_like(logits, float("-inf")).scatter_(-1, i, v)
     # optionally scale the logits and sample from a probability distribution
@@ -75,7 +87,7 @@ def sample(
             logits = sample_top_p(logits, top_p)
         probs = torch.nn.functional.softmax(logits, dim=-1)
         return multinomial_num_samples_1(probs)
-    return torch.argmax(logits, dim=-1, keepdim=True)
+    return torch.argmax(logits, dim=-1)
 
 
 class BatchSampler:
@@ -88,7 +100,7 @@ class BatchSampler:
         self,
         prompts: List[torch.Tensor],
         next_token_pos: int,
-        sample_kwargs: List[Dict[str, Any]]
+        sample_kwargs: List[Dict[str, Any]],
     ):
         self.prompts = prompts
         self.next_token_pos = next_token_pos
@@ -101,7 +113,7 @@ class BatchSampler:
     def __call__(
         self,
         logits: torch.Tensor
-    ) -> Tuple[torch.Tensor, List[bool]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Given `logits`, samples tokens for each batch dimension. Tokens are
         taken from prompts as long as they have not been completely processed.
@@ -110,33 +122,45 @@ class BatchSampler:
         stopped for this dimension.
 
         Args:
-            logits: Logits of shape `(batch_size, n_vocab)`
+            logits: Logits of shape `(batch_size, num, n_vocab)`
 
         Returns:
-            `(tokens, mask)`, where shape of `tokens` is `(batch_size, 1)`
+            `(tokens, mask)`, with shape `(batch_size, num)`
 
         """
         # We only use rows in `logits` corresponding to active dimensions,
         # where a token has to be sampled
-        mask = [False] * self.batch_size
+        assert logits.ndim == 3
+        bs, num, _ = logits.shape
+        assert bs == self.batch_size
+        assert num > 0
         prompt = self.prompts[0]
+        shape = (self.batch_size, num)
+        mask = torch.zeros(
+            shape, dtype=torch.bool, device=prompt.device
+        )
         # Used for dims where sampling has stopped:
         dummy_token = prompt[-1].item()
         tokens = torch.full(
-            (self.batch_size, 1),
+            shape,
             dummy_token,
             dtype=prompt.dtype,
             device=prompt.device
         )
         for i, stopped in enumerate(self.sampling_done):
             if not stopped:
-                if self.next_token_pos >= self.prompt_length[i]:
+                np = self.next_token_pos
+                plen = self.prompt_length[i]
+                if np + num > plen:
+                    tokens[i] = sample(
+                        logits[i], **self.sample_kwargs[i]
+                    ).to(dtype=prompt.dtype)
                     mask[i] = True
-                    token = sample(logits[i], **self.sample_kwargs[i])
-                    tokens[i] = token.item()
-                else:
-                    tokens[i] = self.prompts[i][self.next_token_pos].item()
-        self.next_token_pos += 1
+                if plen > np:
+                    end = min(plen, np + num)
+                    tokens[i, np:end] = self.prompts[i][np:end]
+                    mask[i, np:end] = False
+        self.next_token_pos += num
         return tokens, mask
 
     def stop_sampling(self, dims: List[int]):
@@ -147,12 +171,15 @@ class BatchSampler:
         self,
         token_lists: List[List[int]],
         tokens: torch.Tensor,
-        mask: List[bool],
+        mask: torch.Tensor,
     ):
-        assert len(token_lists) == len(mask) == tokens.shape[0] == self.batch_size
-        for token_list, token, active in zip(token_lists, tokens, mask):
-            if active:
-                token_list.append(token.item())
+        bs, num = tokens.shape
+        assert len(token_lists) == bs == self.batch_size
+        assert mask.shape == (bs, num)
+        for b, token_list in enumerate(token_lists):
+            for i in range(num):
+                if mask[b][i]:
+                    token_list.append(tokens[b][i].item())
 
     def all_dimensions_done(self) -> bool:
         return all(self.sampling_done)
@@ -163,6 +190,7 @@ def batched_generate_fn(
     model: GPT,
     prompts: List[torch.Tensor],
     max_returned_tokens: int,
+    prompt_chunksize: int,
     *,
     sample_args: Union[List[dict], dict],
     stop_tokens: Tuple[List[int], ...] = (),
@@ -176,9 +204,16 @@ def batched_generate_fn(
     Args:
         model: The model to use.
         prompts: A list of size batch_size, containing 1D tensors.
-        max_returned_tokens: The maximum number of tokens to return, including the prompt tokens.
-        sample_args: The dictionary of kwargs to pass to sample() for each each token for each index in the batch.
-        stop_tokens: A tuple of stop sequences. If any of the sequences are generated, the generation stops early before max_returned_tokens.
+        max_returned_tokens: The maximum number of tokens to return, including
+            the prompt tokens.
+        prompt_chunksize: If even the shortest prompt is longer than the KV
+            cache, prompts are processed in chunks of this size in the
+            prefill phase. Once the shortest has been processed to the
+            end, we proceed with chunk size 1.
+        sample_args: The dictionary of kwargs to pass to sample() for each
+            token and each index in the batch.
+        stop_tokens: A tuple of stop sequences. If any of the sequences are
+            generated, the generation stops early before max_returned_tokens.
         include_prompt: Whether to output the prompt tokens.
         include_eos: Whether to output the stop tokens if generation stops early.
 
@@ -191,6 +226,7 @@ def batched_generate_fn(
     """
     batch_size = len(prompts)
     assert batch_size > 0, "No prompts are given"
+    assert prompt_chunksize > 0, "prompt_chunksize must be positive"
     prompt_size = []
     device = prompts[0].device
     prompt_dtype = prompts[0].dtype
@@ -215,43 +251,55 @@ def batched_generate_fn(
         yield prompts
 
     # Prefill phase
-    # We prefill up to the minimum of prompt lengths, and no more than the
-    # maximum prefill length of the KV cache
-    token_pos = min(prompt_size)
+    # We prefill up to the minimum of prompt lengths. if this is longer than
+    # the max prefill length of the KV cache, we call the model to produce
+    # logits in chunks of `prompt_chunksize`. These logits are not used (except
+    # the very last one), but the KV cache is served. The prefill phase ends
+    # with the last token of the shortest prompt being processed.
+    min_prompt_size = min(prompt_size)
     kv_cache_params = model.get_kv_cache_params()
-    max_prefill_length = token_pos if kv_cache_params is None else kv_cache_params.max_prefill_length
-    token_pos = min([token_pos, max_prefill_length])
-    inputs = torch.cat(
-        [prompt[:token_pos].view(1, -1) for prompt in prompts],
-        dim=0,
-    )
-    # We only need the last time slice of `all_logits` below:
-    all_logits = model(inputs, for_prefill=True)
+    max_prefill_length = min_prompt_size if kv_cache_params is None else kv_cache_params.max_prefill_length
+    token_pos = min([min_prompt_size, max_prefill_length])
+    start = 0
+    while True:
+        inputs = torch.cat(
+            [prompt[start:token_pos].view(1, -1) for prompt in prompts],
+            dim=0,
+        )
+        # We may need the last time slice of `all_logits` below:
+        all_logits = model(inputs, for_prefill=(start == 0))
+        start = token_pos
+        if token_pos == min_prompt_size:
+            break
+        chunksize = min(prompt_chunksize, min_prompt_size - token_pos)
+        token_pos += chunksize
+
+    # Generation loop: One token per iteration
+    assert token_pos == min_prompt_size  # Sanity check
     sampler = BatchSampler(
         prompts=prompts,
         next_token_pos=token_pos,
         sample_kwargs=sample_args,
     )
-
-    # Generation loop
     stop_progresses = [[0] * len(stop_tokens) for _ in range(batch_size)] # [batch_size, ~len(stop_tokens)]
     yielded_idx = 0
     token_lists = [[] for _ in range(batch_size)]
     input_pos = token_pos - 1
     tokens = None  # First iteration uses `all_logits`
-    for current_idx in range(max_returned_tokens - token_pos):
+    for _ in range(max_returned_tokens - token_pos):
         # Generate the next token for each prompt in the batch
         if all_logits is not None:
             # Use logits from prefill for the first token after that (last
             # time slice)
-            logits = all_logits[:, -1, :]
+            logits = all_logits[:, -1, :].unsqueeze(1)
             all_logits = None
         else:
-            logits = model(tokens, input_pos=input_pos).squeeze(1)
+            logits = model(tokens, input_pos=input_pos)
         tokens, mask = sampler(logits)
         sampler.append_tokens(token_lists, tokens, mask)
         logits = None
         int_tokens = [token.item() for token in tokens]
+        mask = mask.squeeze(-1).tolist()
 
         # Check for stop sequences
         # For each stop sequence, we keep a running total of how many are matched in stop_progress.
@@ -331,6 +379,7 @@ def generate(
     prompts: List[torch.Tensor],
     max_returned_tokens: int,
     *,
+    prompt_chunksize: int = 1,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     top_p: float = 1.0,
@@ -342,10 +391,26 @@ def generate(
     Takes a list of prompts as input (1D tensors, can be of different lengths)
     and generates tokens as specified.
 
+    Choice of `pro mpt_chunksize`:
+    This parameter can speed up inference for long prompts. Let
+    `M = min_prompt_size - max_prefill_length`, the minimum prompt length
+    minus the max prefill length of the KV cache. If `M > 0`, the prompt
+    prefill uses `ceil(M / prompt_chunksize)` sequential steps, calling
+    model inference for chunks of size `prompt_chunksize`. For larger
+    `prompt_chunksize`, this is faster due to less sequential steps.
+    However, KV cache eviction is done in a more coarse-grained manner,
+    which can lead to worse performance.
+
     Args:
         model: The model to use.
         prompts: List of batch_size 1D tensors, each being a prompt sequence
-        max_returned_tokens: The maximum number of tokens to return (given plus generated).
+        max_returned_tokens: The maximum number of tokens to return (given plus
+            generated).
+        prompt_chunksize: If even the shortest prompt is longer than the KV
+            cache, prompts are processed in chunks of this size in the
+            prefill phase. Once the shortest has been processed to the
+            end, we proceed with chunk size 1.
+            Defaults to 1, but larger values are recommended for long prompts.
         temperature: Scales the predicted logits by 1 / temperature.
         top_k: If specified, only sample among the tokens with the k highest probabilities.
         top_p: If specified, it represents the cumulative probability threshold to consider in the sampling process.
@@ -369,11 +434,16 @@ def generate(
             sequences. Otherwise, this token is stipped off.
 
     """
+    max_tokens_forward = model.kv_cache_max_tokens_forward()
+    if prompt_chunksize > max_tokens_forward:
+        print(f"prompt_chunksize = {prompt_chunksize} > {max_tokens_forward} = max_tokens_forward. Lowering it to the latter.")
+        prompt_chunksize = max_tokens_forward
     token_list = [[] for _ in range(len(prompts))]
     for part in batched_generate_fn(
         model=model,
         prompts=prompts,
         max_returned_tokens=max_returned_tokens,
+        prompt_chunksize=prompt_chunksize,
         sample_args=dict(
             temperature=temperature,
             top_k=top_k,
@@ -397,6 +467,7 @@ def main(
     *,
     num_samples: int = 1,
     max_new_tokens: int = 50,
+    prompt_chunksize: int = 1,
     top_k: Optional[int] = 50,
     top_p: float = 1.0,
     temperature: float = 0.8,
@@ -416,6 +487,11 @@ def main(
         prompt: The prompt string to use for generating the samples.
         num_samples: The number of text samples to generate.
         max_new_tokens: The number of generation steps to take.
+        prompt_chunksize: If even the shortest prompt is longer than the KV
+            cache, prompts are processed in chunks of this size in the
+            prefill phase. Once the shortest has been processed to the
+            end, we proceed with chunk size 1.
+            Defaults to 1, but larger values are recommended for long prompts.
         top_k: The number of top most probable tokens to consider in the sampling process.
         top_p: If specified, it represents the cumulative probability threshold to consider in the sampling process.
             In top-p sampling, the next token is sampled from the highest probability tokens
@@ -506,6 +582,7 @@ def main(
                 model=model,
                 prompts=[encoded],
                 max_returned_tokens=max_returned_tokens,
+                prompt_chunksize=prompt_chunksize,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -517,6 +594,7 @@ def main(
                 model=model,
                 prompts=[encoded],
                 max_returned_tokens=max_returned_tokens,
+                prompt_chunksize=prompt_chunksize,
                 sample_args=dict(
                     temperature=temperature,
                     top_k=top_k,
