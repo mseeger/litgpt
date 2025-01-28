@@ -214,6 +214,17 @@ class GPT(nn.Module):
           check that`input_pos == kv_cache.next_token_pos`. Note that `T > 1`
           is permitted here as well.
 
+        Token generation and `T > 1`:
+
+        This situation is non-standard, since `idx` needs to provide tokens at
+        positions `input_pos:(input_pos + T)`, whereas the logits are for
+        generating tokens at `(input_pos + 1):(input_pos + T + 1)`, so only the
+        last position is needed to generate a new token. Use cases:
+        - Updating KV caches sequentially if prompt size is larger than max
+          prefill length of cache
+        - Speculative decoding. Here, `idx` comes from the cheaper proposal
+          model, and the logits are needed for the accept/reject probabilities.
+
         Args:
             idx: Token indices of input sequences, shape `(B, T)`, where `B`
                 is batch size.
