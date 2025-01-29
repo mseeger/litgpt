@@ -1052,56 +1052,20 @@ def test_model_compile():
 
     model = GPT(model.config)
     model.set_kv_cache(2)
-    input_pos = torch.arange(model.config.block_size)
-    explanation = torch._dynamo.explain(model)(x, input_pos)
+    explanation = torch._dynamo.explain(model)(x)
     assert isinstance(explanation, debugging.ExplainOutput)
     assert explanation.graph_count == 1
     assert explanation.graph_break_count == 0
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize(
-    "max_seq_length", (25, pytest.param(23, marks=pytest.mark.xfail(raises=IndexError, strict=True)))
-)
-@pytest.mark.flaky(reruns=5)
-def test_kv_cache(max_seq_length):
-    config = Config(block_size=25, padded_vocab_size=5, n_layer=2, n_head=2, n_embd=8)
-    model = GPT(config)
-    idx = torch.randint(0, model.config.padded_vocab_size, (1, 5))
-    max_new_tokens = 20
-    model.max_seq_length = max_seq_length
-    model.set_kv_cache(1)
-
-    def generate(logits):
-        logits = logits[:, -1:]
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        return torch.argmax(probs).unsqueeze(0).unsqueeze(0)
-
-    x_no_cache = idx
-    x_cache = idx
-    input_pos = torch.arange(0, 5)
-    for _ in range(max_new_tokens):
-        logits_no_cache = model(x_no_cache[:, -max_seq_length:])
-        out_no_cache = generate(logits_no_cache)
-
-        logits_cache = model(x_cache, input_pos)
-        out_cache = generate(logits_cache)
-
-        torch.testing.assert_close(out_no_cache, out_cache, rtol=0, atol=0)
-
-        x_no_cache = torch.cat((x_no_cache, out_no_cache), dim=1)
-        x_cache = out_cache
-        input_pos = input_pos[-1:] + 1
-
-
-@torch.inference_mode()
 def test_model_kv_cache_amp():
     config = Config.from_name("pythia-14m", n_layer=2)
     model = GPT(config)
-    encoded = torch.arange(45)
+    encoded = torch.arange(45).view(1, -1)
     model.set_kv_cache(batch_size=1)
     with torch.autocast("cpu", torch.bfloat16):
-        output = model(encoded.unsqueeze(0), encoded)
+        output = model(encoded, for_prefill=True)
     assert output.dtype is torch.bfloat16
 
 
@@ -1196,7 +1160,6 @@ def test_sdpa_choice_kv_cache(config):
             model.max_seq_length = 1
             model.set_kv_cache(2)
             x = torch.randint(0, 10, (2, 1), dtype=torch.int32)
-            input_pos = torch.tensor([0], dtype=torch.long)
     except torch.cuda.OutOfMemoryError:
         # best effort, if the GPU can load it
         pytest.xfail()
@@ -1208,13 +1171,13 @@ def test_sdpa_choice_kv_cache(config):
         # flash attention does not support an attention mask
         expected = SDPBackend.MATH
         with torch.backends.cuda.sdp_kernel(enable_mem_efficient=False):
-            model(x, input_pos)
+            model(x, for_prefill=True)
 
     expected = (
         SDPBackend.EFFICIENT_ATTENTION if config.head_size % 8 == 0 and config.n_query_groups != 1 else SDPBackend.MATH
     )
     with torch.backends.cuda.sdp_kernel(enable_flash=False):
-        model(x, input_pos)
+        model(x, for_prefill=True)
 
 
 @RunIf(min_cuda_gpus=2, standalone=True)

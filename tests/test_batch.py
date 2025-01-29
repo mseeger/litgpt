@@ -133,15 +133,15 @@ def test_batch_generate(tmp_path):
     sample_kwargs = {"top_k": 1}
     llm, model = create_llm(tmp_path, batch_size, 50, device)
 
-    batch_x = torch.tensor(
-        [
+    kwargs = dict(device=device, dtype=torch.int64)
+    batch_x = [
+        torch.tensor(lst, **kwargs)
+        for lst in [
             [43993, 25, 1867, 466, 32660, 17485, 4483, 30, 198, 26410],
             [25, 1867, 466, 32660, 17485, 4483, 30, 198, 26410, 7596],
             [1867, 466, 32660, 17485, 4483, 30, 198, 26410, 7596, 7596],
-        ],
-        device=device,
-        dtype=torch.int64,
-    )
+        ]
+    ]
 
     # Generate tokens
     tokens = []
@@ -245,10 +245,6 @@ def test_batch_generate(tmp_path):
 
     torch.use_deterministic_algorithms(False)
 
-    # for t in llm.tokenizer.decode_stream([torch.tensor(i) for i in first_stream]):
-    #    print(t, end="", flush=True)
-    # print()
-
 
 @RunIf(min_cuda_gpus=1)
 def test_batch_generate_equivalence(tmp_path):
@@ -260,15 +256,15 @@ def test_batch_generate_equivalence(tmp_path):
     sample_kwargs = {"top_k": 1}
     llm, model = create_llm(tmp_path, batch_size, 50, device)
 
-    batch_x = torch.tensor(
-        [
+    kwargs = dict(device=device, dtype=torch.int64)
+    batch_x = [
+        torch.tensor(lst, **kwargs)
+        for lst in [
             [43993, 25, 1867, 466, 32660, 17485, 4483, 30, 198, 26410],
             [25, 1867, 466, 32660, 17485, 4483, 30, 198, 26410, 7596],
             [1867, 466, 32660, 17485, 4483, 30, 198, 26410, 7596, 7596],
-        ],
-        device=device,
-        dtype=torch.int64,
-    )
+        ]
+    ]
 
     # The other test tests the stop_tokens functionality much more exhaustively, we'll just generate and compare 50 tokens here.
 

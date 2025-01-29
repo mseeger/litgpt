@@ -448,6 +448,7 @@ class LLM(torch.nn.Module):
         self,
         prompt: str,
         max_new_tokens: int = 50,
+        prompt_chunksize: int = 1,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: float = 1.0,
@@ -461,6 +462,11 @@ class LLM(torch.nn.Module):
             model: The model to use.
             prompt: The prompt string to use for generating the samples.
             max_new_tokens: The maximum number of new tokens to return.
+            prompt_chunksize: If even the shortest prompt is longer than the KV
+                cache, prompts are processed in chunks of this size in the
+                prefill phase. Once the shortest has been processed to the
+                end, we proceed with chunk size 1.
+                Defaults to 1, but larger values are recommended for long prompts.
             temperature: Scales the predicted logits by 1 / temperature.
             top_k: If specified, only sample among the tokens with the k highest probabilities.
             top_p: If specified, it represents the cumulative probability threshold to consider in the sampling process.
@@ -514,6 +520,7 @@ class LLM(torch.nn.Module):
                 model=self.model,
                 prompt=input_ids,
                 max_returned_tokens=max_returned_tokens,
+                prompt_chunksize=prompt_chunksize,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -533,6 +540,7 @@ class LLM(torch.nn.Module):
                 model=self.model,
                 prompt=input_ids,
                 max_returned_tokens=max_returned_tokens,
+                prompt_chunksize=prompt_chunksize,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,

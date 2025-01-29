@@ -86,6 +86,8 @@ class GPT(nn.Module):
         If KV caches are of type `DenseKVCache`, they are resized here if too
         small.
         """
+        if value == self._max_seq_length:
+            return
         if value > self.config.block_size:
             raise ValueError(
                 f"Cannot attend to {value}, block size is only {self.config.block_size}."
@@ -249,8 +251,6 @@ class GPT(nn.Module):
             # Few tokens generation. This needs a KV cache. If none is passed
             # at construction, the caches are created with the first call with
             # `for_prefill=True`.
-            if T != 1:
-                raise ValueError(f"If input_pos is given, sequence length must be 1, but is {T}")
             for l_ix, block in enumerate(self.transformer.h):
                 kv_cache = block.attn.kv_cache
                 if kv_cache is None or kv_cache.next_token_pos is None:
