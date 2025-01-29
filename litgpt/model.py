@@ -642,10 +642,22 @@ class CausalSelfAttention(nn.Module):
             # We need `key` and `value` at the same time here. For the training
             # use case, this will be the case, since `k_and_v` is the default
             # in this case.
+            if self.config.n_query_groups != self.config.n_head:
+                # https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html#torch-nn-functional-scaled-dot-product-attention
+                # `scaled_dot_product_attention` is supposed to support
+                # `query.shape = (bs, nh_q, ...), key.shape = (bs, nh_k, ...)` if
+                # `nh_q` is a multiple of `nh_k`. But this seems not yet supported,
+                # so have to lift K, V here. This is annoying, as it wastes memory.
+                q_per_kv = self.config.n_head // self.config.n_query_groups
+                key = k_and_v.keys().repeat_interleave(q_per_kv, dim=1)
+                value = k_and_v.values().repeat_interleave(q_per_kv, dim=1)
+            else:
+                key = k_and_v.keys()
+                value = k_and_v.values()
             y = F.scaled_dot_product_attention(
                 query=q,
-                key=k_and_v.keys(),
-                value=k_and_v.values(),
+                key=key,
+                value=value,
                 attn_mask=mask,
                 dropout_p=0.0,
                 scale=scale,
@@ -877,11 +889,13 @@ def build_rope_cache(
     idx_theta = torch.outer(seq_idx, theta).repeat(1, 2)
     # If `n_elem` is odd, the final dimension of `idx_theta` has size
     # `n_elem + 1`, so need to cut something off.
+
     # Due to a current bug in Hugging Face, in the case `n_elem == 1`, we leave
     # `idx_theta`, `cos`, `sin` as is. Things work out in `apply_rope` due to
     # broadcasting. If we shorten `idx_theta`, unit tests comparing to
     # Hugging Face fail.
     # https://github.com/huggingface/transformers/issues/35233
+    # TODO: Remove `> 1` once HF bug is fixed!
     if idx_theta.shape[-1] > n_elem > 1:
         idx_theta = idx_theta[..., :n_elem]
 

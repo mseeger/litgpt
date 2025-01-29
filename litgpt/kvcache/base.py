@@ -123,6 +123,8 @@ class KVCache(torch.nn.Module):
         self.n_head = config.n_head
         self.device = device
         self.dtype = dtype
+        # TODO: Remove once HF bug fixed
+        self._work_around_hf_bug = config.rope_n_elem == 1
 
     @property
     def next_token_pos(self) -> Optional[int]:
@@ -273,7 +275,9 @@ class KVCache(torch.nn.Module):
 
 class DefaultKeysAndValues(KeysAndValues):
     def __init__(self, keys: torch.Tensor, values: torch.Tensor):
-        assert keys.shape == values.shape and keys.ndim == 4
+        # TODO: Replace once HF bug fixed!
+        #assert keys.shape == values.shape and keys.ndim == 4, (keys.shape, values.shape)
+        assert keys.shape[:-1] == values.shape[:-1] and keys.ndim == 4, (keys.shape, values.shape)
         self._keys = keys
         self._values = values
 
@@ -324,8 +328,11 @@ class DenseKVCache(KVCache):
             config, batch_size, max_sequence_length, device, dtype
         )
         shape = (batch_size, self.n_query_groups, max_sequence_length, self.head_size)
-        self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
+        # TODO: Remove once HF bug fixed
+        if self._work_around_hf_bug:
+            shape = shape[:-1] + (self.head_size + 1,)
+        self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.next_position = None
         self.eff_batch_size = None
 
@@ -351,7 +358,12 @@ class DenseKVCache(KVCache):
         if np + num > self.cache_length:
             raise IndexError(f"Cache has at most {self.cache_length - np} free slots, cannot add {num} entries")
         shape = (self.eff_batch_size, self.n_query_groups, num, self.head_size)
-        if key.shape != shape or value.shape != shape:
+        # TODO: Remove once HF bug fixed
+        if self._work_around_hf_bug:
+            assert value.shape == shape
+            shape = shape[:-1] + (self.head_size + 1,)
+            assert key.shape == shape
+        elif key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         if key.dtype != value.dtype:
             raise ValueError(f"key.dtype = {key.dtype} != {value.dtype} = value.dtype")
@@ -382,7 +394,12 @@ class DenseKVCache(KVCache):
         if eff_batch_size > self.batch_size:
             raise ValueError(f"key.shape[0] = {eff_batch_size} must be at most batch_size = {self.batch_size}")
         shape = (eff_batch_size, self.n_query_groups, init_length, self.head_size)
-        if key.shape != shape or value.shape != shape:
+        # TODO: Remove once HF bug fixed
+        if self._work_around_hf_bug:
+            assert value.shape == shape
+            shape = shape[:-1] + (self.head_size + 1,)
+            assert key.shape == shape
+        elif key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         # Initialize cache content
         self.k = self.k.to(key.dtype)
@@ -441,8 +458,11 @@ class MostRecentKVCache(KVCache):
             config, batch_size, cache_length, device, dtype
         )
         shape = (batch_size, self.n_query_groups, cache_length, self.head_size)
-        self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
+        # TODO: Remove once HF bug fixed
+        if self._work_around_hf_bug:
+            shape = shape[:-1] + (self.head_size + 1,)
+        self.register_buffer("k", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
         self.register_buffer("token_pos", torch.zeros(cache_length, device=device, dtype=torch.int), persistent=False)
         self.next_position = None
         self.eff_batch_size = None
@@ -468,7 +488,12 @@ class MostRecentKVCache(KVCache):
         if not 1 <= num <= self.max_tokens_forward:
             raise ValueError(f"key.shape[2] = {num}, must be in [1, {self.max_tokens_forward}]")
         shape = (self.eff_batch_size, self.n_query_groups, num, self.head_size)
-        if key.shape != shape or value.shape != shape:
+        # TODO: Remove once HF bug fixed
+        if self._work_around_hf_bug:
+            assert value.shape == shape
+            shape = shape[:-1] + (self.head_size + 1,)
+            assert key.shape == shape
+        elif key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         # Move the buffer to the activation dtype for when AMP is used
         self.k = self.k.to(key.dtype)
@@ -510,7 +535,12 @@ class MostRecentKVCache(KVCache):
         if eff_batch_size > self.batch_size:
             raise ValueError(f"key.shape[0] = {eff_batch_size} must be at most batch_size = {self.batch_size}")
         shape = (eff_batch_size, self.n_query_groups, init_length, self.head_size)
-        if key.shape != shape or value.shape != shape:
+        # TODO: Remove once HF bug fixed
+        if self._work_around_hf_bug:
+            assert value.shape == shape
+            shape = shape[:-1] + (self.head_size + 1,)
+            assert key.shape == shape
+        elif key.shape != shape or value.shape != shape:
             raise ValueError(f"Shapes of key, value must be {shape}, but key.shape = {key.shape}, value.shape = {value.shape}")
         # Initialize cache content
         self.k = self.k.to(key.dtype)
