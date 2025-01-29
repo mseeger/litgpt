@@ -86,7 +86,7 @@ class GPT(nn.Module):
         If KV caches are of type `DenseKVCache`, they are resized here if too
         small.
         """
-        if value == self._max_seq_length:
+        if hasattr(self, "_max_seq_length") and value == self._max_seq_length:
             return
         if value > self.config.block_size:
             raise ValueError(
