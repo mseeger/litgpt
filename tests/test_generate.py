@@ -49,7 +49,14 @@ def test_generate(max_seq_length):
     multinomial_results = []
 
     def multinomial(*args, **kwargs):
-        out = torch.multinomial(*args, **kwargs, num_samples=1)
+        if args:
+            probs = args[0]
+        else:
+            probs = kwargs.get("probs")
+        d0, d1 = probs.shape[:2]
+        if probs.ndim == 3:
+            probs = probs.view(-1, probs.shape[-1])
+        out = torch.multinomial(probs, num_samples=1).view(d0, d1)
         multinomial_results.append(out)
         return out
 
@@ -63,7 +70,8 @@ def test_generate(max_seq_length):
 
     assert out.size(0) == T + max_new_tokens, (out.size(0), T + max_new_tokens)
     multinomial_results = torch.hstack(multinomial_results)
-    expected = torch.cat((input_idx, multinomial_results))
+    print(f"input_idx {input_idx.shape}, multinomial_results: {multinomial_results.shape}")
+    expected = torch.cat((input_idx, multinomial_results.squeeze(0)))
     assert out.shape == expected.shape, (out.shape, expected.shape)
     torch.testing.assert_close(out, expected)
 
