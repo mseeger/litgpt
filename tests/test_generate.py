@@ -34,7 +34,13 @@ def test_generate(max_seq_length):
     T = 5
     input_idx = torch.arange(0, T)
 
-    config = Config(block_size=128, vocab_size=16, n_layer=1, n_head=4, n_embd=8)
+    config = Config(
+        block_size=128,
+        vocab_size=16,
+        n_layer=1,
+        n_head=4,
+        n_embd=8,
+    )
     model = GPT(config)
     model.max_seq_length = max_seq_length
     model.set_kv_cache(batch_size=1)
@@ -114,8 +120,8 @@ def test_generate_single_vs_batch(max_seq_length):
         for prompt in prompts
     ]
 
-    for rb, rs in zip(res_batch, res_single):
-        print(f"{rs}\n{rb}")
+    for rb, rs, prompt in zip(res_batch, res_single, prompts):
+        print(f"rs: {rs}\nrb: {rb}\npr: {prompt}")
         torch.testing.assert_close(rs, rb)
         print("OK")
 

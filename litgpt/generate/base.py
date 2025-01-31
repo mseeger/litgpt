@@ -32,7 +32,10 @@ def multinomial_num_samples_1(probs: torch.Tensor) -> torch.Tensor:
         # Faster alternative to `torch.multinomial(probs, num_samples=1)` that is also CUDAGraph friendly
         distribution = torch.empty_like(probs).exponential_(1)
         return torch.argmax(probs / distribution, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    d0, d1 = probs.shape[:2]
+    if probs.ndim == 3:
+        probs = probs.view(-1, probs.shape[-1])
+    return torch.multinomial(probs, num_samples=1).view(d0, d1)
 
 
 def sample_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -70,7 +73,9 @@ def sample(
     """
     if not (0.0 <= top_p <= 1.0):
         raise ValueError(f"top_p must be in [0, 1], got {top_p}")
-    if logits.dim() != 3:
+    if logits.ndim == 2:
+        logits = logits.unsqueeze(1)
+    elif logits.ndim != 3:
         raise ValueError(f"logits must have dim 3, got {logits.shape}")
     # Now: logits has shape (batch_size, num, n_vocab)
     # optionally crop the logits to only the top k options
@@ -268,7 +273,14 @@ def batched_generate_fn(
             dim=0,
         )
         # We may need the last time slice of `all_logits` below:
-        all_logits = model(inputs, for_prefill=(start == 0))
+        for_prefill = start == 0
+        all_logits = model(inputs, for_prefill=for_prefill)
+        if for_prefill:
+            max_tokens_forward = model.kv_cache_max_tokens_forward()
+            if prompt_chunksize > max_tokens_forward:
+                print(
+                    f"prompt_chunksize = {prompt_chunksize} > {max_tokens_forward} = max_tokens_forward. Lowering it to the latter.")
+                prompt_chunksize = max_tokens_forward
         start = token_pos
         if token_pos == min_prompt_size:
             break
@@ -435,10 +447,6 @@ def generate(
             sequences. Otherwise, this token is stipped off.
 
     """
-    max_tokens_forward = model.kv_cache_max_tokens_forward()
-    if prompt_chunksize > max_tokens_forward:
-        print(f"prompt_chunksize = {prompt_chunksize} > {max_tokens_forward} = max_tokens_forward. Lowering it to the latter.")
-        prompt_chunksize = max_tokens_forward
     token_list = [[] for _ in range(len(prompts))]
     for part in batched_generate_fn(
         model=model,
