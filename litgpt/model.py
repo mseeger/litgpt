@@ -69,7 +69,6 @@ class GPT(nn.Module):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        # Only used if `config.sliding_window_size` is set
         self.mask_cache: Optional[torch.Tensor] = None
         self.max_seq_length = self.config.block_size
 
@@ -476,7 +475,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(
             config.head_size * config.n_head, config.n_embd, bias=config.bias
         )
-        # KV cache (optional)
+        # KV cache (needed for inference)
         self.kv_cache = kv_cache
         self.apply_sliding_window_attention = (
             config.sliding_window_size is not None and
@@ -535,6 +534,7 @@ class CausalSelfAttention(nn.Module):
                     f"T = {T}, must be <= max_tokens_forward = {self.kv_cache.max_tokens_forward}")
             for_prefill = False
         elif for_prefill:
+            # Sanity check
             if self.kv_cache is None:
                 raise ValueError("If for_prefill is True, KV cache must exist")
 
@@ -594,10 +594,7 @@ class CausalSelfAttention(nn.Module):
         # We need the attention mask if there is sliding window attention,
         # or if `input_pos` is given and T > 1.
         is_causal = input_pos is None
-        use_mask = (
-            self.apply_sliding_window_attention is not None or
-            (not is_causal and T > 1)
-        )
+        use_mask = self.apply_sliding_window_attention or (not is_causal and T > 1)
         mask = None
         if use_mask:
             # Special case requires building a mask. `mask_cache` is only needed

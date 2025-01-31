@@ -24,12 +24,15 @@ class KVCacheParams:
         cache_length: int,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        head_size: Optional[int] = None,
     ) -> "KVCacheParams":
+        if head_size is None:
+            head_size = config.n_embd // config.n_head,
         return KVCacheParams(
             batch_size=batch_size,
             n_query_groups=config.n_query_groups,
             cache_length=cache_length,
-            head_size=config.n_embd // config.n_head,
+            head_size=head_size,
             n_head=config.n_head,
             device=device,
             dtype=dtype,
@@ -100,6 +103,7 @@ class KVCache(torch.nn.Module):
         cache_length: int,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        head_size: Optional[int] = None,
     ):
         """
         Note that `batch_size` is the maximum batch size the cache can be used
@@ -112,6 +116,8 @@ class KVCache(torch.nn.Module):
             cache_length: Number of slots in cache
             device: Device for buffers
             dtype: Data type for buffers
+            head_size: Size of final dimension of buffers. Defaults to head
+                size of model
         """
         super().__init__()
         if cache_length <= 0:
@@ -119,7 +125,9 @@ class KVCache(torch.nn.Module):
         self.batch_size = batch_size
         self.n_query_groups = config.n_query_groups
         self.cache_length = cache_length
-        self.head_size = config.n_embd // config.n_head
+        if head_size is None:
+            head_size = config.n_embd // config.n_head
+        self.head_size = head_size
         self.n_head = config.n_head
         self.device = device
         self.dtype = dtype
@@ -229,7 +237,7 @@ class KVCache(torch.nn.Module):
             batch_size=self.batch_size,
             n_query_groups=self.n_query_groups,
             cache_length=self.cache_length,
-            head_size=self.n_head,
+            head_size=self.head_size,
             n_head=self.n_head,
             device=self.device,
             dtype=self.dtype,
@@ -309,6 +317,7 @@ class DenseKVCache(KVCache):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         max_sequence_length: Optional[int] = None,
+        head_size: Optional[int] = None,
     ):
         """
         Args:
@@ -319,13 +328,15 @@ class DenseKVCache(KVCache):
             max_sequence_length: Cache length. If not given, we use
             `config.block_size`
             max_tokens_forward: See parent class
+            head_size: Size of final dimension of buffers. Defaults to head
+                size of model
 
         """
         if max_sequence_length is None:
             max_sequence_length = config.block_size
 
         super().__init__(
-            config, batch_size, max_sequence_length, device, dtype
+            config, batch_size, max_sequence_length, device, dtype, head_size,
         )
         shape = (batch_size, self.n_query_groups, max_sequence_length, self.head_size)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)
@@ -445,6 +456,7 @@ class MostRecentKVCache(KVCache):
         cache_length: int,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        head_size: Optional[int] = None,
     ):
         """
         Args:
@@ -453,9 +465,12 @@ class MostRecentKVCache(KVCache):
             cache_length: Number of slots of cache
             device: Device for buffers
             dtype: Data type for buffers
-    """
+            head_size: Size of final dimension of buffers. Defaults to head
+                size of model
+
+        """
         super().__init__(
-            config, batch_size, cache_length, device, dtype
+            config, batch_size, cache_length, device, dtype, head_size,
         )
         shape = (batch_size, self.n_query_groups, cache_length, self.head_size)
         self.register_buffer("v", torch.zeros(shape, device=device, dtype=dtype), persistent=False)

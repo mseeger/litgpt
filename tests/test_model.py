@@ -696,7 +696,13 @@ def test_against_original_gemma(model_name, device, dtype):
     torch.set_default_dtype(dtype)
 
     T = 5
-    ours_config = Config.from_name(model_name, n_layer=2, n_head=16, n_embd=32, intermediate_size=86)
+    ours_config = Config.from_name(
+        model_name,
+        n_layer=2,
+        n_head=16,
+        n_embd=32,
+        intermediate_size=86,
+    )
     theirs_config = GemmaConfig(
         vocab_size=ours_config.padded_vocab_size,
         hidden_size=ours_config.n_embd,
@@ -761,6 +767,7 @@ def test_against_original_gemma_2(model_name, device, dtype):
         n_head=16,
         n_embd=32,
         intermediate_size=86,
+        rotary_percentage=1.0,  # Gemma2 does not have this
     )
     theirs_config = Gemma2Config(
         vocab_size=ours_config.padded_vocab_size,
@@ -795,7 +802,6 @@ def test_against_original_gemma_2(model_name, device, dtype):
 
     # test end to end
     x = torch.randint(low=0, high=ours_config.padded_vocab_size, size=(T,), device=device).unsqueeze(0)
-    assert x.size(1) == T
     ours_y = ours_model(x)
     theirs_y = theirs_model(x)["logits"].to(dtype)  # HF converts logits to float
     torch.testing.assert_close(ours_y, theirs_y, rtol=3e-5, atol=3e-5)
