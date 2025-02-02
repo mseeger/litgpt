@@ -53,10 +53,10 @@ def test_generate(max_seq_length):
             probs = args[0]
         else:
             probs = kwargs.get("probs")
-        d0, d1 = probs.shape[:2]
-        if probs.ndim == 3:
-            probs = probs.view(-1, probs.shape[-1])
-        out = torch.multinomial(probs, num_samples=1).view(d0, d1)
+        res_shape, fin_dim = probs.shape[:-1], probs.shape[-1]
+        if probs.ndim > 2:
+            probs = probs.view(-1, fin_dim)
+        out = torch.multinomial(probs, num_samples=1).view(*res_shape)
         multinomial_results.append(out)
         return out
 

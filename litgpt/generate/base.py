@@ -32,10 +32,10 @@ def multinomial_num_samples_1(probs: torch.Tensor) -> torch.Tensor:
         # Faster alternative to `torch.multinomial(probs, num_samples=1)` that is also CUDAGraph friendly
         distribution = torch.empty_like(probs).exponential_(1)
         return torch.argmax(probs / distribution, dim=-1)
-    d0, d1 = probs.shape[:2]
-    if probs.ndim == 3:
-        probs = probs.view(-1, probs.shape[-1])
-    return torch.multinomial(probs, num_samples=1).view(d0, d1)
+    res_shape, fin_dim = probs.shape[:-1], probs.shape[-1]
+    if probs.ndim > 2:
+        probs = probs.view(-1, fin_dim)
+    return torch.multinomial(probs, num_samples=1).view(*res_shape)
 
 
 def sample_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -74,7 +74,7 @@ def sample(
     if not (0.0 <= top_p <= 1.0):
         raise ValueError(f"top_p must be in [0, 1], got {top_p}")
     if logits.ndim == 2:
-        logits = logits.unsqueeze(1)
+        logits = logits.unsqueeze(1)  # (batch_size, 1, n_vocab)
     elif logits.ndim != 3:
         raise ValueError(f"logits must have dim 3, got {logits.shape}")
     # Now: logits has shape (batch_size, num, n_vocab)
@@ -92,7 +92,8 @@ def sample(
             logits = sample_top_p(logits, top_p)
         probs = torch.nn.functional.softmax(logits, dim=-1)
         return multinomial_num_samples_1(probs)
-    return torch.argmax(logits, dim=-1)
+    else:
+        return torch.argmax(logits, dim=-1)
 
 
 class BatchSampler:
@@ -237,7 +238,7 @@ def batched_generate_fn(
     prompt_dtype = prompts[0].dtype
     for prompt in prompts:
         sz = prompt.shape[0]
-        assert prompt.dim() == 1 and sz > 0, "Each prompts must be non-empty 1D tensor"
+        assert prompt.ndim == 1 and sz > 0, "Each prompts must be non-empty 1D tensor"
         assert prompt.device == device and prompt.dtype == prompt_dtype, "Prompts must have the same device, dtype"
         prompt_size.append(sz)
     max_prompt_size = max(prompt_size)
@@ -245,11 +246,11 @@ def batched_generate_fn(
     if isinstance(sample_args, dict):
         sample_args = [sample_args] * len(prompts)
     else:
-        assert len(sample_args) == batch_size, "sample_args must have the length as the batch size."
+        assert len(sample_args) == batch_size, "sample_args must have the same length as the batch size."
 
     assert max_returned_tokens > max_prompt_size, f"Not enough space for {max_prompt_size} prompt tokens in a context length of {max_returned_tokens}."
     if model.max_seq_length < max_returned_tokens - 1:
-        raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
+        raise ValueError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
 
     if include_prompt:
         # Return prompts
