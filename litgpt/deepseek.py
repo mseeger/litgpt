@@ -294,3 +294,83 @@ class CausalSelfAttention(nn.Module):
                 state_dict[current_key] = qkv_reassemble(state_dict.pop(legacy_key), self.config)
 
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+
+@dataclass
+class HuggingFaceMLAParameters:
+    config: Config
+    q_a_proj: torch.Tensor
+    q_b_proj: torch.Tensor
+    kv_a_proj_with_mqa: torch.Tensor
+    kv_b_proj: torch.Tensor
+    o_proj: torch.Tensor
+
+    def __post_init__(self):
+        n_embd = self.config.n_embd
+        head_size = self.config.head_size
+        n_head = self.config.n_head
+        q_low_rank = self.config.q_low_rank
+        kv_low_rank = self.config.kv_low_rank
+        rope_head_size = self.config.rope_head_size
+        assert self.q_a_proj.shape == (n_embd, q_low_rank)
+        assert self.q_b_proj.shape == (q_low_rank, n_head * (head_size + rope_head_size))
+        assert self.kv_a_proj_with_mqa.shape == (n_embd, kv_low_rank + rope_head_size)
+        assert self.kv_b_proj.shape == (kv_low_rank, 2 * n_head * head_size)
+        assert self.o_proj.shape == (n_head * head_size, n_embd)
+
+
+@dataclass
+class OurMLAParameters:
+    config: Config
+    qkv_encode: torch.Tensor
+    q_decode: torch.Tensor
+    proj_v: torch.Tensor
+    output_proj: torch.Tensor
+
+    def __post_init__(self):
+        n_embd = self.config.n_embd
+        head_size = self.config.head_size
+        n_head = self.config.n_head
+        q_low_rank = self.config.q_low_rank
+        kv_low_rank = self.config.kv_low_rank
+        rope_head_size = self.config.rope_head_size
+        assert self.qkv_encode.shape == (n_embd, kv_low_rank + rope_head_size + q_low_rank)
+        assert self.q_decode.shape == (q_low_rank, n_head * (kv_low_rank + rope_head_size))
+        assert self.proj_v.shape == (n_head, kv_low_rank, rope_head_size)
+        assert self.output_proj.shape == (n_head * head_size, n_embd)
+
+    @staticmethod
+    def from_huggingface(theirs: HuggingFaceMLAParameters) -> "OurMLAParameters":
+        head_size = theirs.config.head_size
+        n_head = theirs.config.n_head
+        q_low_rank = theirs.config.q_low_rank
+        kv_low_rank = theirs.config.kv_low_rank
+        rope_head_size = theirs.config.rope_head_size
+
+        qkv_encode = torch.cat(
+            (theirs.kv_a_proj_with_mqa, theirs.q_a_proj), dim=-1
+        )
+        q_b_1, q_b_2 = theirs.q_b_proj.split(
+            (n_head * head_size, n_head * rope_head_size), dim=-1
+        )
+        kv_b_1, kv_b_2 = theirs.kv_b_proj.split(
+            (n_head * head_size, n_head * head_size), dim=-1
+        )
+        proj_v = kv_b_2.view(kv_low_rank, n_head, head_size).transpose(0, 1)
+        # q_decode from q_b_1, kv_b_1, and q_b_2
+        q_b_1 = q_b_1.view(q_low_rank, n_head, head_size).transpose(0, 1)
+        kv_b_1 = kv_b_1.transpose(0, 1).view(n_head, head_size, kv_low_rank)
+        # matmul in float32, to decrease numerical errors
+        dtype = theirs.q_b_proj.dtype
+        q_decode_1 = torch.matmul(
+            q_b_1.to(dtype=torch.float32),
+            kv_b_1.to(dtype=torch.float32)
+        ).to(dtype=dtype).transpose(0, 1).view(q_low_rank, n_head * kv_low_rank)
+        q_decode = torch.cat((q_decode_1, q_b_2), dim=-1)
+        return OurMLAParameters(
+            config=theirs.config,
+            qkv_encode=qkv_encode,
+            q_decode=q_decode,
+            proj_v=proj_v,
+            output_proj=theirs.o_proj,
+        )
