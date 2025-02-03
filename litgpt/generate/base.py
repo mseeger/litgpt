@@ -163,9 +163,9 @@ class BatchSampler:
                     ).to(dtype=prompt.dtype)
                     mask[i] = True
                 if plen > np:
-                    end = min(plen, np + num)
-                    tokens[i, np:end] = self.prompts[i][np:end]
-                    mask[i, np:end] = False
+                    end = min(plen - np, num)
+                    tokens[i, :end] = self.prompts[i][np:(np + end)].to(dtype=prompt.dtype)
+                    mask[i, :end] = False
         self.next_token_pos += num
         return tokens, mask
 
@@ -274,7 +274,7 @@ def batched_generate_fn(
             dim=0,
         )
         # We may need the last time slice of `all_logits` below:
-        for_prefill = start == 0
+        for_prefill = start == 0  # First iteration
         all_logits = model(inputs, for_prefill=for_prefill)
         if for_prefill:
             max_tokens_forward = model.kv_cache_max_tokens_forward()
@@ -584,44 +584,18 @@ def main(
     fabric.print(f"Time to load the model weights: {time.perf_counter() - t0:.02f} seconds.", file=sys.stderr)
 
     L.seed_everything(1234)
-    _debug = True
     for i in range(num_samples):
         t0 = time.perf_counter()
-        if not _debug:
-            y = generate(
-                model=model,
-                prompts=[encoded],
-                max_returned_tokens=max_returned_tokens,
-                prompt_chunksize=prompt_chunksize,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                eos_id=int(tokenizer.eos_id),
-            )[0]
-        else:
-            eos_id = int(tokenizer.eos_id)
-            y = list(batched_generate_fn(
-                model=model,
-                prompts=[encoded],
-                max_returned_tokens=max_returned_tokens,
-                prompt_chunksize=prompt_chunksize,
-                sample_args=dict(
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                ),
-                stop_tokens=(([eos_id],) if eos_id is not None else ()),
-                include_prompt=True,
-                include_eos=True,
-            ))
-            token_list = [[]]
-            for part in y:
-                for tl, p in zip(token_list, part):
-                    if p is not None:
-                        tl.append(p)
-            y = [torch.cat(parts) for parts in token_list]
-            y = y[0]
-            print(y)
+        y = generate(
+            model=model,
+            prompts=[encoded],
+            max_returned_tokens=max_returned_tokens,
+            prompt_chunksize=prompt_chunksize,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            eos_id=int(tokenizer.eos_id),
+        )[0]
         t = time.perf_counter() - t0
         fabric.print(tokenizer.decode(y))
         tokens_generated = y.size(0) - prompt_length

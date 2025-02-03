@@ -280,6 +280,9 @@ class KVCache(torch.nn.Module):
         """
         raise NotImplementedError()
 
+    def reset_parameters(self) -> None:
+        pass
+
 
 class DefaultKeysAndValues(KeysAndValues):
     def __init__(self, keys: torch.Tensor, values: torch.Tensor):

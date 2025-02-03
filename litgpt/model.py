@@ -170,6 +170,11 @@ class GPT(nn.Module):
     def reset_parameters(self) -> None:
         # Trigger resetting the rope-cache
         self.cos, self.sin = self.rope_cache(device=self.cos.device)
+        self.mask_cache = build_mask_cache(
+            self.max_seq_length,
+            sliding_window_size=self.config.sliding_window_size,
+            device=self.cos.device,
+        )
 
     @staticmethod
     def _check_kv_cache(

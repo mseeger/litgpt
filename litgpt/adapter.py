@@ -19,7 +19,7 @@ from litgpt.config import Config as BaseConfig
 from litgpt.model import GPT as BaseModel
 from litgpt.model import Block as BaseBlock
 from litgpt.model import CausalSelfAttention as BaseCausalSelfAttention
-from litgpt.kvcache.base import KVCache, KeysAndValues
+from litgpt.kvcache.base import KVCache, KeysAndValues, DefaultKeysAndValues
 
 
 @dataclass
@@ -114,12 +114,10 @@ class CausalSelfAttention(BaseCausalSelfAttention):
         mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
         return_scores: bool = False,
-    ) -> torch.Tensor:
-        # self,
-        # q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
-        y = super().scaled_dot_product_attention(q, k_and_v, mask, is_causal, return_scores)
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        y, scores = super().scaled_dot_product_attention(q, k_and_v, mask, is_causal, return_scores)
         if self.block_idx < self.config.adapter_start_layer:
-            return y
+            return y, scores
 
         aT = self.config.adapter_prompt_length
         if self.adapter_kv_cache is not None:
@@ -143,8 +141,14 @@ class CausalSelfAttention(BaseCausalSelfAttention):
 
         T = q.size(2)
         amask = torch.ones(T, aT, dtype=torch.bool, device=q.device)
-        ay = super().scaled_dot_product_attention(q, ak, av, amask)
-        return y + self.gating_factor * ay
+        a_k_and_v = DefaultKeysAndValues(keys=ak, values=av)
+        ay, _ = super().scaled_dot_product_attention(
+            q=q,
+            k_and_v=a_k_and_v,
+            mask=amask,
+            is_causal=False,
+        )
+        return y + self.gating_factor * ay, scores
 
     def reset_parameters(self) -> None:
         if hasattr(self, "gating_factor"):

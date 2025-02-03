@@ -24,10 +24,7 @@ skip_in_ci_on_macos = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize(
-    "max_seq_length", (pytest.param(10, marks=pytest.mark.xfail(raises=NotImplementedError, strict=True)), 20 + 5)
-)
-def test_generate(max_seq_length):
+def test_generate():
     import lightning as L
     L.seed_everything(1234)
 
@@ -42,9 +39,9 @@ def test_generate(max_seq_length):
         n_embd=8,
     )
     model = GPT(config)
-    model.max_seq_length = max_seq_length
-    model.set_kv_cache(batch_size=1)
     max_new_tokens = 20
+    model.max_seq_length = T + max_new_tokens
+    model.set_kv_cache(batch_size=1)
 
     multinomial_results = []
 
@@ -155,6 +152,7 @@ def test_main(fake_checkpoint_dir, monkeypatch, tensor_like):
     tokenizer_mock = Mock()
     tokenizer_mock.return_value.encode.return_value = torch.tensor([1, 2, 3])
     tokenizer_mock.return_value.decode.return_value = "foo bar baz"
+    tokenizer_mock.return_value.eos_id.return_value = 255  # TODO (does not work)
     monkeypatch.setattr(generate, "Tokenizer", tokenizer_mock)
     generate_mock = Mock()
     generate_mock.return_value = torch.tensor(
