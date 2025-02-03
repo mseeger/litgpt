@@ -340,7 +340,9 @@ class OurMLAParameters:
         assert self.output_proj.shape == (n_head * head_size, n_embd)
 
     @staticmethod
-    def from_huggingface(theirs: HuggingFaceMLAParameters) -> "OurMLAParameters":
+    def from_huggingface(
+        theirs: HuggingFaceMLAParameters
+    ) -> "OurMLAParameters":
         head_size = theirs.config.head_size
         n_head = theirs.config.n_head
         q_low_rank = theirs.config.q_low_rank
@@ -365,7 +367,9 @@ class OurMLAParameters:
         q_decode_1 = torch.matmul(
             q_b_1.to(dtype=torch.float32),
             kv_b_1.to(dtype=torch.float32)
-        ).to(dtype=dtype).transpose(0, 1).view(q_low_rank, n_head * kv_low_rank)
+        ).to(dtype=dtype).transpose(0, 1).view(
+            q_low_rank, n_head * kv_low_rank
+        )
         q_decode = torch.cat((q_decode_1, q_b_2), dim=-1)
         return OurMLAParameters(
             config=theirs.config,
