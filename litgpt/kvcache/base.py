@@ -283,8 +283,7 @@ class KVCache(torch.nn.Module):
 
 class DefaultKeysAndValues(KeysAndValues):
     def __init__(self, keys: torch.Tensor, values: torch.Tensor):
-        # TODO: Replace once HF bug fixed!
-        #assert keys.shape == values.shape and keys.ndim == 4, (keys.shape, values.shape)
+        # The final dimension of K and V can be different
         assert keys.shape[:-1] == values.shape[:-1] and keys.ndim == 4, (keys.shape, values.shape)
         self._keys = keys
         self._values = values

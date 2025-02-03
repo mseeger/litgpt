@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from litgpt.config import Config as BaseConfig
-from litgpt.kvcache import KVCache, DefaultKeysAndValues
-from litgpt.model import apply_rope
+from litgpt.kvcache import KVCache, DenseKVCache, DefaultKeysAndValues, KeysAndValues
+from litgpt.model import apply_rope, batched_index_select, scaled_dot_product_attention
 
 
 @dataclass
@@ -24,6 +24,18 @@ class Config(BaseConfig):
 
 
 class CausalSelfAttention(nn.Module):
+    """
+    Implements multi-head latent attention (MLA) as used in DeepSeek-V3.
+
+    Note: The KV cache for MLA only needs a buffer for K. This buffer is for
+    a single head and has final dimension
+    `config.kv_low_rank + config.rope_head_size`. We can view this buffer as
+    storing `[C_KV, K_R]`, where `C_KV` has final dimension `config.kv_low_rank`,
+    `K_R` has final dimension `config.rope_head_size`. The corresponding
+    :class:`KeysAndValues` object returns `[C_KV, K_R]` for `keys` and
+    `[C_KV]` for `values`.
+
+    """
     def __init__(
         self,
         config: Config,
@@ -31,6 +43,8 @@ class CausalSelfAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> None:
         super().__init__()
+        if config.n_query_groups != 1:
+            raise ValueError("Must have config.n_query_groups == 1 for multi-head latent attention")
         # Maps input X to low-rank C_KV, K_R, C_Q
         self.qkv_encode = nn.Linear(
             config.n_embd,
@@ -43,11 +57,13 @@ class CausalSelfAttention(nn.Module):
             config.n_head * (config.kv_low_rank + config.rope_head_size),
             bias=config.bias,
         )
-        # Maps output of dot product attention to U
-        self.v_proj = nn.Linear(
-            config.kv_low_rank,
-            config.n_head * config.head_size,
-            bias=config.bias,
+        # Maps output of dot product attention to U, separate for each head
+        # This never has bias parameters
+        self.proj_v = nn.Parameter(
+            torch.empty(
+                (config.n_head, config.kv_low_rank, config.head_size),
+                dtype=nn.Linear.dtype,
+            )
         )
         # Output projection
         self.output_proj = nn.Linear(
@@ -97,7 +113,7 @@ class CausalSelfAttention(nn.Module):
         rope_head_size = self.config.rope_head_size
         qk_head_size = kv_low_rank + rope_head_size
 
-        B, T, _ = x.size()  # batch size, sequence length, n_embd
+        B, T, _ = x.size()  # batch_size, sequence_length, n_embd
         if input_pos is not None:
             if self.kv_cache is None or self.kv_cache.next_token_pos is None:
                 raise ValueError("If input_pos is given, KV cache must exist and be initialized (call with for_prefill=True)")
@@ -113,17 +129,17 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError("If for_prefill is True, KV cache must exist")
 
         # Initial map to [C_KV, K_R, C_Q]
-        latents = self.qkv_encode(x)
-        c_kv, k_r, c_q = latents.split(
+        c_kv, k_r, c_q = self.qkv_encode(x).split(
             (kv_low_rank, rope_head_size, q_low_rank), dim=-1
         )
         if self.config.norm_qk:
             c_kv = self.norm_k(c_kv)
             c_q = self.norm_q(c_q)
 
-        # Map to QA equivalent
-        q_equiv = self.q_decode(c_q)
-        q_nope, q_r = q_equiv.split((kv_low_rank, rope_head_size), dim=-1)
+        # Map to Q equivalent
+        q_nope, q_r = self.q_decode(c_q).split(
+            (kv_low_rank, rope_head_size), dim=-1
+        )
 
         # RoPE
         k_r = apply_rope(k_r, cos, sin)
@@ -133,7 +149,10 @@ class CausalSelfAttention(nn.Module):
         k_equiv = torch.cat((c_kv, k_r), dim=-1).view(B, 1, T, qk_head_size)
         q_equiv = torch.cat((q_nope, q_r), dim=-1).view(
             B, T, n_head, qk_head_size).transpose(1, 2)
-        v_equiv = c_kv.view(B, 1, T, head_size)
+        v_equiv = k_equiv[..., :kv_low_rank]
+        # q_equiv: (B, n_head, T, kv_low_rank + rope_head_size)
+        # k_equiv: (B, 1, T, kv_low_rank + rope_head_size)
+        # v_equiv: (B, 1, T, kv_low_rank), part of `k_equiv`
 
         if input_pos is not None:
             # Extend KV cache and retrieve key, value tensors to be used.
@@ -149,7 +168,6 @@ class CausalSelfAttention(nn.Module):
             # Only k is really used
             k_and_v = DefaultKeysAndValues(k_equiv, v_equiv)
 
-        # HIER!!
         # We need the attention mask if there is sliding window attention,
         # or if `input_pos` is given and T > 1.
         is_causal = input_pos is None
@@ -171,23 +189,23 @@ class CausalSelfAttention(nn.Module):
                     idx=self.kv_cache.token_positions(),
                 )
 
-        # Efficient attention using Flash Attention CUDA kernels.
-        # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
-        # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
         return_scores = input_pos is not None and self.kv_cache.update_requires_attn_weights()
         y, scores = self.scaled_dot_product_attention(
-            q, k_and_v, mask, is_causal, return_scores
+            q_equiv, k_and_v, mask, is_causal, return_scores
         )
-
+        # y: (B, T, n_head, kv_low_rank)
         if return_scores:
             # Pass attention weights to KV cache
             self.kv_cache.update(attn_weights=scores)
 
-        # Re-assemble all head outputs side by side.
-        y = y.reshape(B, T, head_size * n_head)
+        # Linear map to U^h, and reassemble all heads
+        y = torch.matmul(
+            y,
+            self.v_proj.view(1, 1, n_head, kv_low_rank, head_size)
+        ).view(B, T, n_head * head_size)
 
         # Output projection.
-        return self.proj(y)  # (B, T, C)
+        return self.proj(y)  # (B, T, n_embd)
 
     def scaled_dot_product_attention(
         self,
@@ -245,6 +263,11 @@ class CausalSelfAttention(nn.Module):
             scores = None
         return y.transpose(1, 2), scores
 
+    # TODO: Need specific dense KV cache here:
+    # - Only one buffer for K, shape (batch_size, 1, cache_length, qk_head_size)
+    # - V is slice in K
+    # - Write wrapper class (mixin?), so that all other KV caches can be used in
+    #   this way!
     def create_default_kv_cache(
         self,
         batch_size: int,
@@ -260,6 +283,7 @@ class CausalSelfAttention(nn.Module):
             max_sequence_length=max_sequence_length,
         )
 
+    # TODO!
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:
         """For compatibility with legacy checkpoints."""
 
