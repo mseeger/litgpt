@@ -94,11 +94,11 @@ class KVCache(torch.nn.Module):
     :meth:`prefill`, which also determines the effective batch size
     `eff_batch_size`. Then, new KV information is added sequentially by calling
     :meth:`forward`. The information can be for one or more tokens, up to
-    `max_tokens_forward`. For most caches, :meth:`update` needs to be called
+    `max_tokens_forward`. For some caches, :meth:`update` needs to be called
     after each :meth:`forward`, passing extra information. See for example
     :meth:`update_requires_attn_weights`.
 
-    Note: In general, key tensors need to be position-encoded.
+    Note: In general, key tensors need to be position-encoded (e.g., RoPE).
     """
     def __init__(
         self,
@@ -130,12 +130,13 @@ class KVCache(torch.nn.Module):
         self.n_query_groups = config.n_query_groups
         self.cache_length = cache_length
         if head_size is None:
-            head_size = config.n_embd // config.n_head
+            head_size = config.head_size
         self.head_size = head_size
         self.n_head = config.n_head
         self.device = device
         self.dtype = dtype
-        # TODO: Remove once HF bug fixed
+        # TODO: Remove once HuggingFace bug is fixed
+        # https://github.com/huggingface/transformers/issues/35233
         self._work_around_hf_bug = config.rope_n_elem == 1
 
     @property
@@ -218,11 +219,11 @@ class KVCache(torch.nn.Module):
         return False
 
     @property
-    def max_prefill_length(self) -> int:
+    def max_prefill_length(self) -> Optional[int]:
         """
         Returns:
             Maximum sequence length for `key`, `value` tensors passed to
-            :meth:`prefill`.
+            :meth:`prefill`. If there is no such maximum length, `None` is returned.
 
         """
         raise NotImplementedError()
@@ -372,7 +373,7 @@ class DenseKVCache(KVCache):
         return self.cache_length
 
     @property
-    def max_prefill_length(self) -> int:
+    def max_prefill_length(self) -> Optional[int]:
         return self.cache_length
 
     @property
@@ -513,8 +514,8 @@ class MostRecentKVCache(KVCache):
         return self.cache_length
 
     @property
-    def max_prefill_length(self) -> int:
-        return self.cache_length
+    def max_prefill_length(self) -> Optional[int]:
+        return None
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         if self.next_position is None:
@@ -566,8 +567,7 @@ class MostRecentKVCache(KVCache):
         if key.dim() != 4:
             raise ValueError("key must have 4 dimensions")
         init_length = key.shape[2]
-        if init_length > self.max_prefill_length:
-            raise ValueError(f"key.shape[2] = {init_length}, must be at most {self.max_prefill_length}")
+        eff_init_length = min(init_length, self.cache_length)
         eff_batch_size = key.shape[0]
         if eff_batch_size > self.batch_size:
             raise ValueError(f"key.shape[0] = {eff_batch_size} must be at most batch_size = {self.batch_size}")
@@ -582,14 +582,17 @@ class MostRecentKVCache(KVCache):
         # Initialize cache content
         self.k = self.k.to(key.dtype)
         self.v = self.v.to(value.dtype)
-        self.k[:eff_batch_size, :, :init_length, :] = key
-        self.v[:eff_batch_size, :, :init_length, :] = value
-        self.token_pos[:init_length] = torch.arange(
-            init_length, dtype=self.token_pos.dtype, device=self.token_pos.device
+        self.k[:eff_batch_size, :, :eff_init_length, :] = key[:, :, -eff_init_length:, :]
+        self.v[:eff_batch_size, :, :eff_init_length, :] = value[:, :, -eff_init_length:, :]
+        self.token_pos[:eff_init_length] = torch.arange(
+            init_length - eff_init_length,
+            init_length,
+            dtype=self.token_pos.dtype,
+            device=self.token_pos.device,
         )
-        self.current_length = init_length
+        self.current_length = eff_init_length
         self._next_token_pos = init_length
-        self.next_position = init_length % self.cache_length
+        self.next_position = eff_init_length % self.cache_length
         self.eff_batch_size = eff_batch_size
 
     def token_positions(self) -> torch.Tensor:

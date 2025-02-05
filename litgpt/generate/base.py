@@ -76,7 +76,7 @@ def sample(
     if logits.ndim == 2:
         logits = logits.unsqueeze(1)  # (batch_size, 1, n_vocab)
     elif logits.ndim != 3:
-        raise ValueError(f"logits must have dim 3, got {logits.shape}")
+        raise ValueError(f"logits must be 3D tensor, got {logits.shape}")
     # Now: logits has shape (batch_size, num, n_vocab)
     # optionally crop the logits to only the top k options
     if top_k is not None:

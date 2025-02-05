@@ -494,9 +494,8 @@ class GPT(BaseModel):
         if kv_cache is not None:
             if len(kv_cache) != config.n_layer:
                 raise ValueError(f"kv_cache length {len(kv_cache)} != {config.n_layer} = config.n_layer")
-            max_prefill_length = kv_cache[0].max_prefill_length
             for kvc in kv_cache:
-                self._check_kv_cache(config, kvc, max_prefill_length)
+                self._check_kv_cache(config, kvc)
             self._default_kv_cache = False
         else:
             kv_cache = [None] * config.n_layer
@@ -518,7 +517,6 @@ class GPT(BaseModel):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        # Only used if `config.sliding_window_size` is set
         self.mask_cache: Optional[torch.Tensor] = None
         self.max_seq_length = self.config.block_size
 

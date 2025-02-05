@@ -63,25 +63,27 @@ def generate(
     """
     from litgpt.generate.base import batched_generate_fn
 
-    for part in batched_generate_fn(
-        model=model,
-        prompts=[prompt],
-        max_returned_tokens=max_returned_tokens,
-        prompt_chunksize=prompt_chunksize,
-        sample_args = dict(
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        ),
-        stop_tokens=stop_tokens,
-        include_prompt=False,
-        include_eos=False,
-    ):
-        yield part[0]
+    return map(
+        lambda lst: lst[0],
+        batched_generate_fn(
+            model=model,
+            prompts=[prompt],
+            max_returned_tokens=max_returned_tokens,
+            prompt_chunksize=prompt_chunksize,
+            sample_args = dict(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            ),
+            stop_tokens=stop_tokens,
+            include_prompt=False,
+            include_eos=False,
+        )
+    )
 
 
 def process_prompt(
-    prompt: torch.Tensor,
+    prompt: str,
     model: GPT,
     tokenizer,
     prompt_style,

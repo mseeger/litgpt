@@ -35,7 +35,6 @@ from litgpt.utils import (
 )
 
 
-# TODO: This does not work with special KV caches, only with default ones
 @torch.inference_mode()
 def sequential(
     model: GPT,
@@ -78,7 +77,7 @@ def sequential(
             _materialize_meta_tensors(submodule, target_device)
     # rebuild odd ends
     with root:
-        # Setting `maxs_seq_length` forces other members to be built
+        # Setting `max_seq_length` forces other members to be built
         if model.max_seq_length == max_seq_length:
             model.max_seq_length = max_seq_length + 1
         model.max_seq_length = max_seq_length

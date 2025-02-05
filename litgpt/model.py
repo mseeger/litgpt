@@ -7,6 +7,7 @@ https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 """
 
 import math
+from multiprocessing.managers import Value
 from typing import Any, Optional, Tuple, Union, List
 from functools import partial
 
@@ -49,11 +50,12 @@ class GPT(nn.Module):
         if kv_cache is not None:
             if len(kv_cache) != config.n_layer:
                 raise ValueError(f"kv_cache length {len(kv_cache)} != {config.n_layer} = config.n_layer")
-            max_prefill_length = kv_cache[0].max_prefill_length
             for kvc in kv_cache:
-                self._check_kv_cache(config, kvc, max_prefill_length)
+                self._check_kv_cache(config, kvc)
             self._default_kv_cache = False
         else:
+            # Default KV caches will be created once first required, or
+            # if `set_kv_cache` is called.
             kv_cache = [None] * config.n_layer
             self._default_kv_cache = True
         self.lm_head = nn.Linear(
@@ -85,8 +87,6 @@ class GPT(nn.Module):
         If KV caches are of type `DenseKVCache`, they are resized here if too
         small.
         """
-        if hasattr(self, "_max_seq_length") and value == self._max_seq_length:
-            return
         if value > self.config.block_size:
             raise ValueError(
                 f"Cannot attend to {value}, block size is only {self.config.block_size}."
@@ -99,9 +99,11 @@ class GPT(nn.Module):
             cos, sin = self.rope_cache()
             self.register_buffer("cos", cos, persistent=False)
             self.register_buffer("sin", sin, persistent=False)
-        elif value != self.cos.size(0):
+        elif self.cos.size(0) < value:
             self.cos, self.sin = self.rope_cache(device=self.cos.device)
         # KV caches
+        # Only need to do something for :class:`DenseKVCache` caches, all others
+        # are supposed to be independent of `max_seq_length`.
         for l_ix, block in enumerate(self.transformer.h):
             attn = block.attn
             kv_cache = attn.kv_cache
@@ -180,7 +182,6 @@ class GPT(nn.Module):
     def _check_kv_cache(
         config: Config,
         kv_cache: KVCache,
-        max_prefill_length: Optional[int] = None,
     ):
         params = kv_cache.get_params()
         if config.n_query_groups != params.n_query_groups:
@@ -190,8 +191,6 @@ class GPT(nn.Module):
         head_size = config.n_embd // config.n_head
         if head_size != params.head_size:
             raise ValueError(f"config and kv_cache not compatible: config.head_size = {head_size} != {params.head_size} = kv_cache.head_size")
-        if max_prefill_length is not None and params.max_prefill_length != max_prefill_length:
-            raise ValueError("The KV caches for all layers must have the same max_prefill_length")
 
     def _init_weights(self, module: nn.Module) -> None:
         """Meant to be used with `gpt.apply(gpt._init_weights)`."""
@@ -214,7 +213,8 @@ class GPT(nn.Module):
         - Training: `input_pos=None`, `for_prefill=False`. KV cache not needed.
         - Inference, prefill: `input_pos=None`, `for_prefill=True`. Same as
           training, but KV cache is initialized with K and V vectors. If KV
-          caches are not present, they are created here.
+          caches are not present, they are created here (using default dense KV
+          caches which store all K, V information).
         - Inference, token generation: `input_pos` given, `for_prefill`
           is ignored. KV caches must be given, they are used and updated. We
           check that`input_pos == kv_cache.next_token_pos`. Note that `T > 1`
@@ -246,8 +246,10 @@ class GPT(nn.Module):
             entry can be shorter.
 
         """
-        if idx.dim() == 1:
+        if idx.ndim == 1:
             idx = idx.unsqueeze(0)
+        elif idx.ndim != 2:
+            raise ValueError(f"idx must be 1D or 2D tensor, but idx.shape = {idx.shape}")
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -284,16 +286,19 @@ class GPT(nn.Module):
         for l_ix, block in enumerate(self.transformer.h):
             if for_prefill:
                 # Create default KV caches if not present, or if batch size of
-                # cache is too small
+                # cache is too small (latter only if default cache)
                 batch_size = x.shape[0]
                 create_def_cache = False
                 attn = block.attn
                 if attn.kv_cache is None:
                     print(f"Allocating KV cache for layer {l_ix}")
                     create_def_cache = True
-                elif self._default_kv_cache and attn.kv_cache.batch_size < batch_size:
-                    print(f"Re-allocating KV cache for layer {l_ix} (batch size was too small)")
-                    create_def_cache = True
+                elif attn.kv_cache.batch_size < batch_size:
+                    if self._default_kv_cache:
+                        print(f"Re-allocating KV cache for layer {l_ix} (batch size was too small)")
+                        create_def_cache = True
+                    else:
+                        raise ValueError(f"Batch size {batch_size} is too large for KV cache layer {l_ix} (batch size {attn.kv_cache.batch_size})")
                 if create_def_cache:
                     # Same device and dtype as input `x`
                     attn.create_default_kv_cache(
@@ -382,7 +387,11 @@ class GPT(nn.Module):
         if any(cache is None for cache in caches):
             return None
         else:
-            return min(cache.max_prefill_length for cache in caches)
+            mlps = [kvc.max_prefill_length for kvc in caches]
+            if all(mlp is None for mlp in mlps):
+                return None
+            else:
+                return min(mlp for mlp in mlps if mlp is not None)
 
 
 class Block(nn.Module):
@@ -620,7 +629,7 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        return_scores = input_pos is not None and self.kv_cache.update_requires_attn_weights()
+        return_scores = (not is_causal) and self.kv_cache.update_requires_attn_weights()
         y, scores = self.scaled_dot_product_attention(
             q, k_and_v, mask, is_causal, return_scores
         )
@@ -646,7 +655,11 @@ class CausalSelfAttention(nn.Module):
         assert mask is None or not is_causal, "Cannot have mask and is_causal=True"
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
 
-        # with softcapping we cannot use SDPA
+        # We cannot call PyTorch scaled_dot_product_attention if:
+        # - Attention scores need to be returned; or
+        # - Logit softcapping is required; or
+        # - We cannot access keys and values from `k_and_v` in parallel (this
+        #   never happens if `is_causal == True`)
         if return_scores or self.config.attention_logit_softcapping is not None or not k_and_v.both_in_parallel():
             y, scores = scaled_dot_product_attention(
                 query=q,
@@ -683,11 +696,11 @@ class CausalSelfAttention(nn.Module):
                     # `scaled_dot_product_attention` is supposed to support
                     # `query.shape = (bs, nh_q, ...), key.shape = (bs, nh_k, ...)`
                     # and `nh_k < nh_q` if `nh_q` is a multiple of `nh_k`. But
-                    # this seems not yet supported, so have to lift K, V here.
-                    # This is annoying, as it wastes memory.
+                    # this seems not yet supported (in 2.5.1), so have to lift
+                    # K, V here. This is annoying, as it wastes memory.
                     q_per_kv = self.config.n_head // self.config.n_query_groups
-                    key = k_and_v.keys().repeat_interleave(q_per_kv, dim=1)
-                    value = k_and_v.values().repeat_interleave(q_per_kv, dim=1)
+                    key = key.repeat_interleave(q_per_kv, dim=1)
+                    value = value.repeat_interleave(q_per_kv, dim=1)
             scores = None
         return y.transpose(1, 2), scores
 
@@ -794,12 +807,14 @@ def _attention_compute_scores(
     query: torch.Tensor,
     key: torch.Tensor,
 ) -> torch.Tensor:
-    # - query: (bs, nh_q, T_q, hs)
-    # - key: (bs, nh_k, T_k, hs)
+    assert query.ndim == key.ndim == 4
+    assert query.shape[0] == key.shape[0] and query.shape[3] == key.shape[3]
     nh_q = query.shape[1]
     nh_k = key.shape[1]
+    assert nh_q % nh_k == 0
+    # - query: (bs, nh_q, T_q, hs)
+    # - key: (bs, nh_k, T_k, hs)
     q_per_kv = nh_q // nh_k
-    assert nh_q == nh_k * q_per_kv
     key_transposed = key.mT  # (bs, nh_k, hs, T_k)
     if q_per_kv == 1:
         return query @ key_transposed
@@ -809,7 +824,7 @@ def _attention_compute_scores(
         _query = query.view(*q_shape)
         key_transposed = key_transposed.unsqueeze(2)
         # At this point:
-        # - query: (bs, nh_k, q_per_kv, T_q, hs)
+        # - _query: (bs, nh_k, q_per_kv, T_q, hs)
         # - key_transposed: (bs, nh_k, 1, hs, T_k)
         # - scores: (bs, nh_k, q_per_kv, T_q, T_k)
         scores = torch.matmul(_query, key_transposed)
@@ -821,10 +836,13 @@ def _attention_compute_weighted_values(
     scores: torch.Tensor,
     value: torch.Tensor,
 ) -> torch.Tensor:
-    # - scores: (bs, nh_q, T_q, T_k)
-    # - value: (bs, nh_k, T_k, hs)
+    assert scores.ndim == value.ndim == 4
+    assert scores.shape[0] == scores.shape[0] and scores.shape[3] == value.shape[2]
     nh_q = scores.shape[1]
     nh_k = value.shape[1]
+    assert nh_q % nh_k == 0
+    # - scores: (bs, nh_q, T_q, T_k)
+    # - value: (bs, nh_k, T_k, hs)
     q_per_kv = nh_q // nh_k
     if q_per_kv == 1:
         return scores @ value
@@ -833,8 +851,8 @@ def _attention_compute_weighted_values(
         _scores = scores.view(*s_shape)
         _value = value.unsqueeze(2)
         # At this point:
-        # - scores: (bs, nh_k, q_per_kv, T_q, T_k)
-        # - value: (bs, nh_k, 1, T_k, hs)
+        # - _scores: (bs, nh_k, q_per_kv, T_q, T_k)
+        # - _value: (bs, nh_k, 1, T_k, hs)
         # - result: (bs, nh_k, q_per_kv, T_q, hs)
         result = torch.matmul(_scores, _value)
         r_shape = scores.shape[:-1] + (value.shape[-1],)
@@ -862,7 +880,8 @@ def scaled_dot_product_attention(
     if mask is not None:
         scores = scores + mask
     scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)
-    return _attention_compute_weighted_values(scores, k_and_v.values()), scores
+    value = k_and_v.values()
+    return _attention_compute_weighted_values(scores, value), scores
 
 
 def build_rope_cache(
@@ -933,7 +952,7 @@ def batched_index_select(
     idx: torch.Tensor
 ) -> torch.Tensor:
     """index_select for batched index and unbatched t"""
-    if idx.dim() == 1:
+    if idx.ndim == 1:
         return torch.index_select(t, dim, idx)
 
     *batch_shape, idx_size = idx.shape
@@ -942,7 +961,7 @@ def batched_index_select(
     res = res.view(*t.shape[:dim], -1, idx_size, *t.shape[dim + 1 :])
     if dim > 0:
         # move batch dim to front, this is np.rollaxis(res, dim, 0) for tensors
-        dims = [dim] + list(range(res.dim()))
+        dims = [dim] + list(range(res.ndim))
         del dims[dim + 1]
         res = res.permute(dims)
     # unflatten batch dims
@@ -963,7 +982,7 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     Returns:
         Encoded tensor, `(B, ..., T, head_size)`
     """
-    if cos.dim() != 3:
+    if cos.ndim != 3:
         raise ValueError(f"cos must be three-dimensional, but shape is {cos.shape}")
     if cos.shape != sin.shape:
         raise ValueError(f"cos, sin must have same shape, but cos.shape={cos.shape}, sin.shape={sin.shape}")
@@ -971,7 +990,7 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     x1 = x[..., : head_size_half]  # (B, ..., T, head_size/2)
     x2 = x[..., head_size_half :]  # (B, ..., T, head_size/2)
     rotated = torch.cat((-x2, x1), dim=-1)  # (B, ..., T, head_size)
-    dims_diff = x.dim() - cos.dim()
+    dims_diff = x.ndim - cos.ndim
     if dims_diff > 0:
         # Ensure that shapes of `x`, `cos`, `sin` align
         new_shape = cos.shape[0:1] + (1,) * dims_diff + cos.shape[1:]
