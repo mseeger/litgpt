@@ -42,8 +42,12 @@ class KVCacheParams:
 class KeysAndValues:
     """
     Object returned by :meth:`KVCache.forward`. Allows to access cached
-    keys or values, but not both at the same time. Implementations may use the
-    same buffer to return them in the methods below.
+    keys or values, but (in general) not both at the same time. Implementations
+    may use the same buffer to return them in the methods below.
+
+    However, if :meth:`both_in_parallel` returns `True`, the tensors returned
+    by :meth:`keys` and :meth:`values` may be used in parallel, since they are
+    supported by separate buffers.
 
     """
     def keys(self) -> torch.Tensor:
@@ -82,7 +86,7 @@ class KVCache(torch.nn.Module):
 
     Buffers have shapes
     `(batch_size, config.n_query_groups, cache_length, head_size)`, where
-    `head_size = config.n_embed // config.n_head`. Caching can be used for
+    `head_size` is a parameter. Caching can be used for
     batch size `1 <= eff_batch_size <= batch_size`, which is determined in
     the :meth:`prefill` call.
 
@@ -187,6 +191,11 @@ class KVCache(torch.nn.Module):
         this method updates internal scores and takes a decision which slot
         is evicted upon the next :meth:`forward` call (if the cache is full).
 
+        One important example are KV caches based on the Heavy Hitter Oracle
+        (H2O) proposal. These require the attention weights from the current
+        MLA computation to be passed, and :meth:`update_requires_attn_weights`
+        has to return `True`.
+
         Note: The extra information typically scales with `num`, the number of
         tokens :meth:`forward` was called for.
 
@@ -286,7 +295,7 @@ class KVCache(torch.nn.Module):
 
 class DefaultKeysAndValues(KeysAndValues):
     def __init__(self, keys: torch.Tensor, values: torch.Tensor):
-        # The final dimension of K and V can be different
+        # The final dimension of K and V can be different (in general)
         assert keys.shape[:-1] == values.shape[:-1] and keys.ndim == 4, (keys.shape, values.shape)
         self._keys = keys
         self._values = values
@@ -299,6 +308,11 @@ class DefaultKeysAndValues(KeysAndValues):
 
     @staticmethod
     def both_in_parallel() -> bool:
+        """
+        Keys and values are supported by different buffers, so they can be
+        used at the same time.
+
+        """
         return True
 
 
@@ -360,6 +374,10 @@ class DenseKVCache(KVCache):
     @property
     def max_prefill_length(self) -> int:
         return self.cache_length
+
+    @property
+    def current_length(self) -> int:
+        return self.next_position
 
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         if self.next_position is None:
@@ -501,6 +519,8 @@ class MostRecentKVCache(KVCache):
     def forward(self, key: torch.Tensor, value: torch.Tensor) -> KeysAndValues:
         if self.next_position is None:
             raise IndexError("Cache needs to be initialized with 'prefill' before being used")
+        if key.ndim != 4:
+            raise ValueError(f"key must be a 4D tensor, but has shape {key.shape}")
         num = key.shape[2]
         if not 1 <= num <= self.max_tokens_forward:
             raise ValueError(f"key.shape[2] = {num}, must be in [1, {self.max_tokens_forward}]")
