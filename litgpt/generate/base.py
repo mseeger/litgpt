@@ -202,6 +202,7 @@ def batched_generate_fn(
     stop_tokens: Tuple[List[int], ...] = (),
     include_prompt: bool,
     include_eos: bool,
+    max_prefill_length: Optional[int],
 ) -> Iterator[List[Optional[torch.Tensor]]]:
     """
     Generates tokens for a list of prompts, which need not have the same
@@ -222,6 +223,7 @@ def batched_generate_fn(
             generated, the generation stops early before max_returned_tokens.
         include_prompt: Whether to output the prompt tokens.
         include_eos: Whether to output the stop tokens if generation stops early.
+        max_prefill_length: See :func:`generate`.
 
     Yields:
         A list of tokens for each prompt in the batch, or None if a stop
@@ -229,6 +231,7 @@ def batched_generate_fn(
         or if the prompt is still being processed for that index (only if
         include_prompt is False). The number of tokens yielded can depend
         on the batch index, can be more than one.
+
     """
     batch_size = len(prompts)
     assert batch_size > 0, "No prompts are given"
@@ -263,10 +266,15 @@ def batched_generate_fn(
     # the very last one), but the KV cache is served. The prefill phase ends
     # with the last token of the shortest prompt being processed.
     min_prompt_size = min(prompt_size)
-    max_prefill_length = model.kv_cache_max_prefill_length()
+    mlp2 = model.kv_cache_max_prefill_length()
     if max_prefill_length is None:
-        max_prefill_length = min_prompt_size
-    token_pos = min(min_prompt_size, max_prefill_length)
+        max_prefill_length = mlp2
+    elif mlp2 is not None:
+        max_prefill_length = min(max_prefill_length, mlp2)
+    if max_prefill_length is None:
+        token_pos = min_prompt_size
+    else:
+        token_pos = min(min_prompt_size, max_prefill_length)
     start = 0
     while True:
         inputs = torch.cat(
@@ -399,6 +407,7 @@ def generate(
     eos_id: Optional[int] = None,
     include_prompt: bool = True,
     include_eos: bool = True,
+    max_prefill_length: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """
     Takes a list of prompts as input (1D tensors, can be of different lengths)
@@ -454,6 +463,10 @@ def generate(
             the prompt style) to the output.
         include_eos: If true (default), include <eos> token at the end of
             sequences. Otherwise, this token is stipped off.
+        max_prefill_length: KV caches are prefilled with a single multi-head
+            attention computation, before potentially using sequential steps.
+            Provides the maximum length for this initial prefill. Most KV caches
+            provide this limit, but some do not.
 
     """
     token_list = [[] for _ in range(len(prompts))]
@@ -470,6 +483,7 @@ def generate(
         stop_tokens=(([eos_id],) if eos_id is not None else ()),
         include_prompt=include_prompt,
         include_eos=include_eos,
+        max_prefill_length=max_prefill_length,
     ):
         for tl, p in zip(token_list, part):
             if p is not None:
