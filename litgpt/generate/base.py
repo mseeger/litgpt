@@ -232,7 +232,7 @@ def batched_generate_fn(
     """
     batch_size = len(prompts)
     assert batch_size > 0, "No prompts are given"
-    assert prompt_chunksize > 0, "prompt_chunksize must be positive"
+    assert prompt_chunksize >= 1, "prompt_chunksize must be positive"
     prompt_size = []
     device = prompts[0].device
     prompt_dtype = prompts[0].dtype
@@ -266,7 +266,7 @@ def batched_generate_fn(
     max_prefill_length = model.kv_cache_max_prefill_length()
     if max_prefill_length is None:
         max_prefill_length = min_prompt_size
-    token_pos = min([min_prompt_size, max_prefill_length])
+    token_pos = min(min_prompt_size, max_prefill_length)
     start = 0
     while True:
         inputs = torch.cat(
@@ -275,7 +275,7 @@ def batched_generate_fn(
         )
         # We may need the last time slice of `all_logits` below:
         all_logits = model(inputs, input_pos=start)
-        if token_pos == min_prompt_size:
+        if token_pos >= min_prompt_size:
             break
         start = token_pos
         # Note that `max_tokens_forward` can change during the course of
