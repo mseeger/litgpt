@@ -70,8 +70,7 @@ class KeysAndValues:
          """
         raise NotImplementedError()
 
-    @staticmethod
-    def both_in_parallel() -> bool:
+    def both_in_parallel(self) -> bool:
         """
         Returns:
             Can use both `keys` and `values` in parallel? Otherwise, can only
@@ -334,8 +333,7 @@ class DefaultKeysAndValues(KeysAndValues):
     def values(self) -> torch.Tensor:
         return self._values
 
-    @staticmethod
-    def both_in_parallel() -> bool:
+    def both_in_parallel(self) -> bool:
         """
         Keys and values are supported by different buffers, so they can be
         used at the same time.

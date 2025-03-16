@@ -306,12 +306,15 @@ class GPT(nn.Module):
 
         for l_ix, block in enumerate(self.transformer.h):
             if for_prefill:
-                # Create default KV caches if not present, or if batch size of
-                # cache is too small (latter only if default cache)
+                # Complain if batch size of cache is too small
                 eff_batch_size = x.shape[0]
                 attn = block.attn
                 if attn.kv_cache.batch_size < eff_batch_size:
                     raise ValueError(f"Batch size {eff_batch_size} is too large for KV cache layer {l_ix} (batch size {attn.kv_cache.batch_size}). Use 'assign_kv_caches' or `set_kv_cache'")
+            hook = self.config.start_of_layer_hook
+            if hook is not None:
+                # Call start of layer hook, passing detached layer input
+                hook(x.detach(), l_ix)
             x = block(x, cos, sin, idx, input_pos, self.mask_cache)
 
         x = self.transformer.ln_f(x)
