@@ -162,7 +162,7 @@ class MultiHeadSelfAttention:
                     sliding_window_size=self.config.sliding_window_size,
                     dtype=query.dtype,
                     device=query.device,
-                ).view(1, 1, T, T)
+                ).view(1, 1, T, T).detach()
                 is_causal = False
             else:
                 # We need a mask if T > 1, since inference needs to be causal
@@ -175,7 +175,7 @@ class MultiHeadSelfAttention:
                     dtype=query.dtype,
                     device=query.device,
                     sliding_window_size=self.config.sliding_window_size,
-                )
+                ).detach()
                 # mask has shape (B, n_query_groups, T, kv_len), must have
                 # shape (B, n_head, T, kv_len)
                 nh_q = self.config.n_head
