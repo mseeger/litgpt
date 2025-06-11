@@ -142,8 +142,7 @@ class MultiHeadSelfAttention:
             attention weights are not returned.
 
         """
-        # We need the attention mask if there is sliding window attention,
-        # or if `input_pos > 0` and T > 1.
+        # We need the attention mask if there is sliding window attention
         for_prefill = input_pos == 0
         is_causal = input_pos is None or for_prefill
         if not is_causal and token_positions is None:
@@ -152,9 +151,8 @@ class MultiHeadSelfAttention:
             self.config.sliding_window_size is not None and self.config.sliding_window_indices[block_idx] == 1
         )
         B, _, T, _ = query.shape
-        use_mask = apply_sliding_window_attention or (not is_causal and T > 1)
         mask = None
-        if use_mask:
+        if apply_sliding_window_attention:
             # Special case requires building a mask
             if is_causal:
                 mask = build_mask_cache(
@@ -194,6 +192,7 @@ class MultiHeadSelfAttention:
             mask,
             is_causal,
             return_scores,
+            token_positions,
         )
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, -1)
@@ -215,31 +214,16 @@ class MultiHeadSelfAttention:
                 kernels = self._sdpa_kernels
             else:
                 kernels = [self._sdpa_kernels]
-            params = SDPAParams(
-                query, key, value, attn_mask, dropout_p, is_causal, enable_gqa
+            new_kernels = filter_sdpa_kernels(
+                sdpa_kernels=kernels,
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                enable_gqa=enable_gqa,
             )
-            warning_lst = []
-            new_kernels = []
-            for kernel in kernels:
-                if kernel == SDPBackend.FLASH_ATTENTION:
-                    if not can_use_flash_attention(params):
-                        warning_lst.append("- SDPBackend.FLASH_ATTENTION")
-                        continue
-                elif kernel == SDPBackend.EFFICIENT_ATTENTION:
-                    if not can_use_efficient_attention(params):
-                        warning_lst.append("- SDPBackend.EFFICIENT_ATTENTION")
-                        continue
-                elif kernel == SDPBackend.CUDNN_ATTENTION:
-                    if not can_use_cudnn_attention(params):
-                        warning_lst.append("- SDPBackend.CUDNN_ATTENTION")
-                        continue
-                new_kernels.append(kernel)
-            if warning_lst:
-                warning_lst.insert(0, "The following SDPA backends are not available:")
-                warning_lst.append(
-                    "This may lead to worse runtime or memory consumption. Consider using a more recent PyTorch version or a different GPU instance."
-                )
-                print("\n".join(warning_lst))
             self._sdpa_kernels = new_kernels if new_kernels else None
             self._sdpa_kernels_filtered = True
 
@@ -250,6 +234,8 @@ class MultiHeadSelfAttention:
         mask: Optional[torch.Tensor] = None,
         is_causal: bool = True,
         return_scores: bool = False,
+        input_pos: Optional[int] = None,
+        token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert mask is None or not is_causal, "Cannot have mask and is_causal=True"
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
@@ -461,3 +447,105 @@ def do_softcapping(x: torch.Tensor, thresh: Optional[float]) -> torch.Tensor:
         return torch.tanh(x / thresh) * thresh
     else:
         return x
+
+
+def needs_reordering_keys_values(
+    input_pos: int,
+    num: int,
+    token_positions: torch.Tensor,
+) -> bool:
+    """
+    See :func:`reorder_keys_values`. Here, we check some common conditions
+    under which the ordering already supports `is_causal=True`. If this is
+    the case, we return `False` (no reordering is needed).
+
+    Args:
+        input_pos: Position of first new token
+        num: Number of new tokens 'q_len`
+        token_positions: Token positions in KV cache
+
+    Returns:
+        Do keys and values buffers have to be reordered?
+
+    """
+    if num == 1:
+        return False
+    should_be = torch.arange(
+        input_pos,
+        input_pos + num,
+        device=token_positions.device,
+        dtype=token_positions.dtype,
+    ).view(1, 1, -1).expand(*token_positions.shape[:-1], -1)
+    return (token_positions[:, :, (-num):] != should_be).any().sum().item() > 0
+
+
+def reorder_keys_values(
+    input_pos: int,
+    num: int,
+    token_positions: torch.Tensor,
+) -> torch.Tensor:
+    """
+    In order to call `F.scaled_dot_product_attention` with `is_causal=True`,
+    the key and value buffers must be ordered such that the final `num`
+    entries correspond to the most recent tokens
+    `input_pos:(input_pos + num)`. Here, we create an index of the same
+    shape as `token_positions`, which performs such a reordering.
+
+    Args:
+        input_pos: Position of first new token
+        num: Number of new tokens 'q_len`
+        token_positions: Token positions in KV cache
+
+    Returns:
+        Index to reorder key and value buffers
+
+    """
+    assert token_positions.ndim == 3
+    batch_size, n_query_groups, cache_length = token_positions.shape
+    assert cache_length >= num
+    reorder_index = torch.empty_like(token_positions)
+    dtype = token_positions.dtype
+    # Distinguish between token positions >= input_pos (1), and the rest
+    # (2). For (1), each token_position[b, h, :] is a permutation of
+    # input_pos:(input_pos + num). We use their argsort shifted to
+    # (cache_length - num):cache_length. The content of (2) does not
+    # matter, we map each token_position[b, h, :] to 0:(cache_length - num).
+    is_new = token_positions >= input_pos
+    thresh = cache_length - num
+    temp_pos = token_positions[is_new]
+    should_be = batch_size * n_query_groups * num
+    assert temp_pos.numel() == should_be, f"{temp_pos.numel()} token_positions entries >= {input_pos}, should be {should_be}"
+    sort_ind = temp_pos.view(
+        batch_size, n_query_groups, -1,
+    ).argsort(dim=-1) + thresh
+    reorder_index[is_new] = sort_ind.flatten().to(dtype=dtype)
+    reorder_index[~is_new] = torch.arange(
+        thresh, dtype=dtype, device=token_positions.device,
+    ).unsqueeze(0).expand(batch_size * n_query_groups, -1).flatten()
+    return reorder_index
+
+
+def filter_sdpa_kernels(
+    sdpa_kernels: List[SDPBackend],
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    dropout_p: float,
+    is_causal: bool,
+    enable_gqa: bool,
+    **kwargs,
+) -> List[SDPBackend]:
+    params = SDPAParams(
+        query, key, value, attn_mask, dropout_p, is_causal, enable_gqa
+    )
+    new_kernels = []
+    for kernel in sdpa_kernels:
+        if kernel == SDPBackend.FLASH_ATTENTION and not can_use_flash_attention(params):
+            continue
+        elif kernel == SDPBackend.EFFICIENT_ATTENTION and not can_use_efficient_attention(params):
+            continue
+        elif kernel == SDPBackend.CUDNN_ATTENTION and not can_use_cudnn_attention(params):
+            continue
+        new_kernels.append(kernel)
+    return new_kernels
