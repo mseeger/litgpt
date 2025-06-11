@@ -17,13 +17,11 @@ from litgpt.kvcache import KVCache
 from litgpt.utils import batched_index_select
 
 from litgpt.attention import (
-    build_mask_cache,
-    build_mask_slice,
     DefaultKeysAndValues,
     do_softcapping,
     MultiHeadSelfAttention,
-    scaled_dot_product_attention,
 )
+from litgpt.attention_utils import scaled_dot_product_attention, build_mask_cache, build_mask_slice
 
 
 @pytest.mark.parametrize(

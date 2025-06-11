@@ -5,12 +5,12 @@ from torch.autograd import Function
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from litgpt.attention import (
-    reorder_keys_values,
+from litgpt.attention_utils import (
     needs_reordering_keys_values,
+    reorder_keys_values,
     filter_sdpa_kernels,
-    _attention_compute_scores,
-    _minus_infinity,
+    attention_compute_scores,
+    minus_infinity,
 )
 
 
@@ -131,7 +131,7 @@ class SDPAFunction(Function):
                 raise ValueError(f"grad_y.shape = {grad_y.shape}, query.shape = {query.shape}, must be the same")
             grad_y = grad_y.to(dtype=torch.float32)
             # Compute attention weights f(S)
-            tmp_array1 = _attention_compute_scores(
+            tmp_array1 = attention_compute_scores(
                 query=query, key=key,
             )
             tmp_array1 *= scale_factor  # S without masking
@@ -146,7 +146,7 @@ class SDPAFunction(Function):
             mask_index = torch.arange(offset, kv_len, **kwargs).unsqueeze(-1) < torch.arange(kv_len, **kwargs).unsqueeze(0)
             tmp_array1[
                 mask_index.view(1, 1, -1, -1).expand_as(tmp_array1)
-            ] = _minus_infinity(dtype=tmp_array1.dtype)  # S
+            ] = minus_infinity(dtype=tmp_array1.dtype)  # S
             # Softmax
             tmp_array2 = F.softmax(tmp_array1, dim=-1)  # f(S)
             if need_value:

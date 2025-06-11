@@ -36,14 +36,13 @@ from transformers.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from transformers.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 
 import litgpt.attention
+import litgpt.attention_utils
 import litgpt.config as config_module
 from litgpt import GPT, Config
 from litgpt.attention import (
-    build_mask_cache,
-    build_mask_slice,
     DefaultKeysAndValues,
-    scaled_dot_product_attention,
 )
+from litgpt.attention_utils import scaled_dot_product_attention, build_mask_cache, build_mask_slice
 from litgpt.model import CausalSelfAttention
 from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_falcon,
@@ -1410,8 +1409,8 @@ def test_sdpa_choice(config):
         pytest.xfail()
 
     for h in model.transformer.h:
-        litgpt.attention.scaled_dot_product_attention = partial(
-            assert_sdpa_backend, litgpt.attention.scaled_dot_product_attention
+        litgpt.attention_utils.scaled_dot_product_attention = partial(
+            assert_sdpa_backend, litgpt.attention_utils.scaled_dot_product_attention
         )
 
     if SUPPORTS_FLASH_ATTENTION:
@@ -1462,8 +1461,8 @@ def test_sdpa_choice_kv_cache(config):
         pytest.xfail()
 
     for h in model.transformer.h:
-        litgpt.attention.scaled_dot_product_attention = partial(
-            assert_sdpa_backend, litgpt.attention.scaled_dot_product_attention
+        litgpt.attention_utils.scaled_dot_product_attention = partial(
+            assert_sdpa_backend, litgpt.attention_utils.scaled_dot_product_attention
         )
 
     if SUPPORTS_FLASH_ATTENTION:
