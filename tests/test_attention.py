@@ -1,8 +1,9 @@
 import math
 import random
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import torch
+from lxml.html.diff import token
 from torch.nn import functional as F
 import pytest
 
@@ -19,9 +20,13 @@ from litgpt.utils import batched_index_select
 from litgpt.attention import (
     DefaultKeysAndValues,
     do_softcapping,
-    MultiHeadSelfAttention,
+    MultiHeadSelfAttention, scaled_dot_product_attention,
 )
-from litgpt.attention_utils import scaled_dot_product_attention, build_mask_cache, build_mask_slice
+from litgpt.attention_utils import (
+    build_mask_cache,
+    build_mask_slice,
+)
+from litgpt.sdpa_op import SDPAFunction
 
 
 @pytest.mark.parametrize(
@@ -471,3 +476,105 @@ def test_multi_head_attention_for_gemma(model_name, dtype):
             mask=None,
         )
         torch.testing.assert_close(outputs_new, outputs_old)
+
+
+def copy_requires_grad(x: torch.Tensor) -> torch.Tensor:
+    return x.clone().detach().requires_grad_(True)
+
+
+@pytest.mark.parametrize(
+    ("n_head", "n_query_groups", "q_len", "kv_len", "dtype"),
+    (
+        (4, 2, 128, 512, torch.float32),
+        (4, 4, 1, 256, torch.float32),
+        (8, 4, 128, 128, torch.float32),
+        (12, 4, 16, 512, torch.float32),
+        (24, 8, 2, 512, torch.float16),
+        (9, 3, 128, 512, torch.bfloat16),
+    ),
+)
+def test_sdpa_op_gradients(n_head, n_query_groups, q_len, kv_len, dtype):
+    seed = 31415927
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    num_repeats = 32
+    seq_len = 2 * kv_len
+    input_pos = seq_len - q_len
+
+    print(f"n_head={n_head}, n_query_groups={n_query_groups}, q_len={q_len}, kv_len={kv_len}, dtype={dtype}")
+    for repeat in range(num_repeats):
+        head_size = 2 ** random.randint(3, 6)
+        batch_size = random.randint(1, 5)
+        is_causal = repeat % 2 == 0
+        index_kwargs = dict(dtype=torch.int64, device=torch.device("cpu"))
+        token_positions = None
+        if is_causal:
+            if repeat % 4 != 0:
+                token_positions = torch.arange(
+                    kv_len, **index_kwargs,
+                ).view(1, 1, -1).expand(batch_size, n_query_groups, -1)
+        else:
+            token_positions = torch.zeros(
+                (batch_size, n_query_groups, kv_len), **index_kwargs,
+            )
+            for bs in range(batch_size):
+                for nq in range(n_query_groups):
+                    token_positions[bs, nq, :] = torch.randperm(
+                        input_pos, **index_kwargs,
+                    )[:kv_len]
+                    # Ensure that `input_pos:seq_len` is present
+                    index = torch.randperm(kv_len, **index_kwargs)[:q_len]
+                    token_positions[bs, nq, index] = torch.arange(
+                        input_pos, seq_len, **index_kwargs,
+                    )
+        shape = (batch_size, n_head, q_len, head_size)
+        _query = torch.randn(shape, dtype=dtype)
+        shape = (batch_size, n_query_groups, kv_len, head_size)
+        _key = torch.randn(shape, dtype=dtype)
+        _value = torch.randn(shape, dtype=dtype)
+        scale = 1.0 / math.sqrt(head_size)
+        gradients = dict()
+        for kind in ("op", "noop"):
+            query = copy_requires_grad(_query)
+            key = copy_requires_grad(_key)
+            value = copy_requires_grad(_value)
+            if kind == "op":
+                y = SDPAFunction.apply(
+                    query,
+                    key,
+                    value,
+                    token_positions,
+                    input_pos,
+                    scale,
+                )
+            else:
+                if is_causal:
+                    attn_mask = None
+                else:
+                    attn_mask = build_mask_slice(
+                        input_pos=input_pos,
+                        num=q_len,
+                        token_positions=token_positions,
+                        **index_kwargs,
+                    )
+                y = F.scaled_dot_product_attention(
+                    query=query,
+                    key=key,
+                    value=value,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    scale=scale,
+                    is_causal=is_causal,
+                    enable_gqa=n_query_groups < n_head,
+                )
+            loss = y.sum()
+            loss.backward()
+            gradients[kind] = (query.grad, key.grad, value.grad)
+        # Compare
+        for name, grad_op, grad_noop in zip(
+            ("query", "key", "value"), gradients["op"], gradients["noop"],
+        ):
+            print(f"Compare gradients for {name}")
+            torch.testing.assert_close(
+                grad_op, grad_noop, atol=0.0005, rtol=0.05,
+            )

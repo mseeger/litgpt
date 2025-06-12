@@ -26,7 +26,7 @@ class SDPAFunction(Function):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        token_positions: torch.Tensor,
+        token_positions: Optional[torch.Tensor],
         input_pos: int,
         scale_factor: float,
         sdpa_kernels: Optional[Union[SDPBackend, List[SDPBackend]]] = None,
@@ -39,7 +39,8 @@ class SDPAFunction(Function):
         _, n_head, q_len, _ = query.shape
         assert q_len <= kv_len
         assert n_query_groups <= n_head and n_head % n_query_groups == 0
-        assert token_positions.shape == key.shape[:-1]
+        if token_positions is not None:
+            assert token_positions.shape == key.shape[:-1]
         # Prepare inputs (reordering, casting)
         query, key, value, _ = SDPAFunction._prepare_inputs(
             query, key, value, token_positions, input_pos,
@@ -72,12 +73,12 @@ class SDPAFunction(Function):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        token_positions: torch.Tensor,
+        token_positions: Optional[torch.Tensor],
         input_pos: int,
     ):
         _, _, q_len, head_size = query.shape
         # Reordering (if necessary)
-        if needs_reordering_keys_values(
+        if token_positions is not None and needs_reordering_keys_values(
             input_pos, q_len, token_positions,
         ):
             reorder_index = reorder_keys_values(
@@ -97,7 +98,6 @@ class SDPAFunction(Function):
     def setup_context(ctx, inputs, output):
         query, key, value, token_positions, input_pos, scale_factor, sdpa_kernels = inputs
         ctx.save_for_backward(query, key, value, token_positions)
-        ctx.mark_non_differentiable(token_positions)
         ctx.extra_args = dict(
             input_pos=input_pos,
             scale_factor=scale_factor,
@@ -145,7 +145,7 @@ class SDPAFunction(Function):
             kwargs = dict(device=device, dtype=torch.int)
             mask_index = torch.arange(offset, kv_len, **kwargs).unsqueeze(-1) < torch.arange(kv_len, **kwargs).unsqueeze(0)
             tmp_array1[
-                mask_index.view(1, 1, -1, -1).expand_as(tmp_array1)
+                mask_index[None, None, :, :].expand_as(tmp_array1)
             ] = minus_infinity(dtype=tmp_array1.dtype)  # S
             # Softmax
             tmp_array2 = F.softmax(tmp_array1, dim=-1)  # f(S)

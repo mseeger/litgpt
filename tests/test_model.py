@@ -40,9 +40,9 @@ import litgpt.attention_utils
 import litgpt.config as config_module
 from litgpt import GPT, Config
 from litgpt.attention import (
-    DefaultKeysAndValues,
+    DefaultKeysAndValues, scaled_dot_product_attention,
 )
-from litgpt.attention_utils import scaled_dot_product_attention, build_mask_cache, build_mask_slice
+from litgpt.attention_utils import build_mask_cache, build_mask_slice
 from litgpt.model import CausalSelfAttention
 from litgpt.scripts.convert_hf_checkpoint import (
     copy_weights_falcon,
@@ -1409,8 +1409,8 @@ def test_sdpa_choice(config):
         pytest.xfail()
 
     for h in model.transformer.h:
-        litgpt.attention_utils.scaled_dot_product_attention = partial(
-            assert_sdpa_backend, litgpt.attention_utils.scaled_dot_product_attention
+        litgpt.attention.scaled_dot_product_attention = partial(
+            assert_sdpa_backend, litgpt.attention.scaled_dot_product_attention
         )
 
     if SUPPORTS_FLASH_ATTENTION:
@@ -1461,8 +1461,8 @@ def test_sdpa_choice_kv_cache(config):
         pytest.xfail()
 
     for h in model.transformer.h:
-        litgpt.attention_utils.scaled_dot_product_attention = partial(
-            assert_sdpa_backend, litgpt.attention_utils.scaled_dot_product_attention
+        litgpt.attention.scaled_dot_product_attention = partial(
+            assert_sdpa_backend, litgpt.attention.scaled_dot_product_attention
         )
 
     if SUPPORTS_FLASH_ATTENTION:

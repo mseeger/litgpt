@@ -1,11 +1,12 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
-from torch.backends.cuda import can_use_flash_attention, can_use_efficient_attention, can_use_cudnn_attention
-from torch.nn import functional as F
+from torch.backends.cuda import (
+    can_use_flash_attention,
+    can_use_efficient_attention,
+    can_use_cudnn_attention,
+)
 from torch.nn.attention import SDPBackend, SDPAParams
-
-from litgpt.attention import KeysAndValues, do_softcapping
 
 
 def needs_reordering_keys_values(
@@ -108,33 +109,6 @@ def filter_sdpa_kernels(
             continue
         new_kernels.append(kernel)
     return new_kernels
-
-
-def scaled_dot_product_attention(
-    query: torch.Tensor,
-    k_and_v: KeysAndValues,
-    scale: float,
-    mask: Optional[torch.Tensor] = None,
-    attention_logit_softcapping: Optional[float] = None,
-    is_causal: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    dtype = query.dtype
-    key = k_and_v.keys()
-    # Scale both `query` and `key` by `sqrt(scale)`, as is done in
-    # `torch.nn.functional.scaled_dot_product_attention`
-    scores = attention_compute_scores(query, key) * scale
-    scores = do_softcapping(scores, attention_logit_softcapping)
-    if mask is None and is_causal:
-        T = query.shape[2]
-        assert key.shape[2] == T, "is_causal=True only if query, key have same size"
-        mask = torch.ones(T, T, dtype=dtype, device=query.device).triu(diagonal=1)
-        mask.masked_fill_(mask.bool(), torch.finfo(dtype).min)
-        mask = mask.view(1, 1, T, T)
-    if mask is not None:
-        scores = scores + mask
-    scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)
-    value = k_and_v.values()
-    return attention_compute_weighted_values(scores, value), scores
 
 
 def attention_compute_scores(
