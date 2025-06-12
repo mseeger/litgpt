@@ -11,6 +11,7 @@ from litgpt.attention_utils import (
     build_mask_slice,
     attention_compute_scores,
     attention_compute_weighted_values,
+    minus_infinity,
 )
 from litgpt.config import Config
 
@@ -172,17 +173,11 @@ class MultiHeadSelfAttention:
                     input_pos=input_pos,
                     num=T,
                     token_positions=token_positions,
+                    n_head=self.config.n_head,
                     dtype=query.dtype,
                     device=query.device,
                     sliding_window_size=self.config.sliding_window_size,
                 ).detach()
-                # mask has shape (B, n_query_groups, T, kv_len), must have
-                # shape (B, n_head, T, kv_len)
-                nh_q = self.config.n_head
-                nh_k = self.config.n_query_groups
-                q_per_kv = nh_q // nh_k
-                if q_per_kv > 1:
-                    mask = mask.unsqueeze(2).expand(-1, -1, q_per_kv, -1, -1).reshape(B, nh_q, T, -1)
 
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
@@ -309,7 +304,7 @@ def scaled_dot_product_attention(
         T = query.shape[2]
         assert key.shape[2] == T, "is_causal=True only if query, key have same size"
         mask = torch.ones(T, T, dtype=dtype, device=query.device).triu(diagonal=1)
-        mask.masked_fill_(mask.bool(), torch.finfo(dtype).min)
+        mask.masked_fill_(mask.bool(), minus_infinity(dtype))
         mask = mask.view(1, 1, T, T)
     if mask is not None:
         scores = scores + mask

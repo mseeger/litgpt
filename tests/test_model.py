@@ -1676,6 +1676,7 @@ def test_build_mask_slice(
             input_pos=input_pos,
             num=num,
             token_positions=token_positions,
+            n_head=n_query_groups,
             dtype=dtype,
             device=device,
             sliding_window_size=sliding_window_size,

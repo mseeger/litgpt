@@ -151,7 +151,12 @@ class SDPAFunction(Function):
             tmp_array2 = F.softmax(tmp_array1, dim=-1)  # f(S)
             if need_value:
                 # Avoid transpose of `tmp_array2`, which may create copy
-                grad_value = torch.matmul(grad_y.mT, tmp_array2).mT.to(dtype=dtype)
+                grad_value = torch.matmul(grad_y.mT, tmp_array2)
+                if q_per_kv > 1:
+                    grad_value = grad_value.view(
+                        batch_size, n_query_groups, q_per_kv, head_size, kv_len,
+                    ).sum(dim=2)
+                grad_value = grad_value.mT.to(dtype=dtype)
                 if reorder_index is not None:
                     grad_value = torch.scatter(
                         grad_value, dim=2, index=reorder_index, src=grad_value,
@@ -186,6 +191,7 @@ class SDPAFunction(Function):
                         # _arg2: (bs, nh_k, 1, kv_len, hs)
                         grad_query = torch.matmul(_arg1, _arg2).view(*query.shape)
                     grad_query *= scale_factor
+                    grad_query = grad_query.to(dtype=dtype)
                 if need_key:
                     # Compute matmul(E.mT, Q)
                     # Avoid transpose of `tmp_array1`, which may create copy
@@ -194,6 +200,7 @@ class SDPAFunction(Function):
                         grad_key = grad_key.view(
                             batch_size, n_query_groups, q_per_kv, head_size, kv_len,
                         ).sum(dim=2)
+                    grad_key *= scale_factor
                     grad_key = grad_key.mT.to(dtype=dtype)
                     if reorder_index is not None:
                         grad_key = torch.scatter(

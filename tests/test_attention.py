@@ -135,6 +135,7 @@ def test_build_mask_slice(
             input_pos=input_pos,
             num=num,
             token_positions=token_positions,
+            n_head=n_query_groups,
             dtype=dtype,
             device=device,
             sliding_window_size=sliding_window_size,
@@ -506,6 +507,7 @@ def test_sdpa_op_gradients(n_head, n_query_groups, q_len, kv_len, dtype):
         head_size = 2 ** random.randint(3, 6)
         batch_size = random.randint(1, 5)
         is_causal = repeat % 2 == 0
+        print(f"repeat={repeat}, is_causal={is_causal}, head_size={head_size}, batch_size={batch_size}")
         index_kwargs = dict(dtype=torch.int64, device=torch.device("cpu"))
         token_positions = None
         if is_causal:
@@ -532,6 +534,9 @@ def test_sdpa_op_gradients(n_head, n_query_groups, q_len, kv_len, dtype):
         shape = (batch_size, n_query_groups, kv_len, head_size)
         _key = torch.randn(shape, dtype=dtype)
         _value = torch.randn(shape, dtype=dtype)
+        print(f"query {_query.shape}, key {_key.shape}, value {_value.shape}")
+        if token_positions is not None:
+            print(f"token_positions {token_positions.shape}")
         scale = 1.0 / math.sqrt(head_size)
         gradients = dict()
         for kind in ("op", "noop"):
@@ -549,19 +554,22 @@ def test_sdpa_op_gradients(n_head, n_query_groups, q_len, kv_len, dtype):
                 )
             else:
                 if is_causal:
-                    attn_mask = None
+                    mask = None
                 else:
-                    attn_mask = build_mask_slice(
+                    mask = build_mask_slice(
                         input_pos=input_pos,
                         num=q_len,
                         token_positions=token_positions,
-                        **index_kwargs,
-                    )
+                        n_head=n_head,
+                        dtype=dtype,
+                        device=torch.device("cpu"),
+                    ).detach()
+                    print(f"mask {mask.shape}")
                 y = F.scaled_dot_product_attention(
                     query=query,
                     key=key,
                     value=value,
-                    attn_mask=attn_mask,
+                    attn_mask=mask,
                     dropout_p=0.0,
                     scale=scale,
                     is_causal=is_causal,

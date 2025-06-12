@@ -201,6 +201,7 @@ def build_mask_slice(
     input_pos: int,
     num: int,
     token_positions: torch.Tensor,
+    n_head: int,
     dtype: torch.dtype,
     device: torch.device,
     sliding_window_size: Optional[int] = None,
@@ -213,12 +214,14 @@ def build_mask_slice(
         num: Length of query argument `q_len`
         token_positions: Token positions in KV cache, shape
             `(eff_batch_size, n_query_groups, cache_length)`
+        n_head: Number of attention heads, must be multiple of
+            `n_query_groups`
         dtype: Data type of the output mask
         device: Device of the output mask
         sliding_window_size: Size of sliding window (if any)
 
     Returns:
-        Mask tensor, shape `(eff_batch_size, n_query_groups, num, cache_length)`
+        Mask tensor, shape `(eff_batch_size, n_head, num, cache_length)`
 
     """
     # Build boolean mask, then map False -> 0, True -> -infty
@@ -227,6 +230,7 @@ def build_mask_slice(
     # this translates to I(i >= j + sws) if sws = sliding_window_size.
     assert token_positions.ndim == 3
     tp_dtype = token_positions.dtype
+    batch_size, n_query_groups, _ = token_positions.shape
     token_positions = token_positions.unsqueeze(2).to(device=device)
     kwargs = dict(device=device, dtype=tp_dtype)
     bool_mask = torch.arange(
@@ -241,4 +245,9 @@ def build_mask_slice(
         bool_mask += extra_mask
     mask = torch.zeros(bool_mask.shape, dtype=dtype, device=device)
     mask.masked_fill_(bool_mask, minus_infinity(dtype))
+    q_per_kv = n_head // n_query_groups
+    if q_per_kv > 1:
+        mask = mask.unsqueeze(2).expand(
+            -1, -1, q_per_kv, -1, -1,
+        ).reshape(batch_size, n_head, num, -1)
     return mask
