@@ -155,8 +155,10 @@ class MultiHeadSelfAttention:
         )
         B, _, T, _ = query.shape
         mask = None
-        if apply_sliding_window_attention:
-            # Special case requires building a mask
+        if apply_sliding_window_attention or self._use_eager_sdpa(
+            return_attn_weights, k_and_v,
+        ) or not is_causal:
+            # Build attention mask
             if is_causal:
                 mask = build_mask_cache(
                     max_seq_length=T,
@@ -164,7 +166,6 @@ class MultiHeadSelfAttention:
                     dtype=query.dtype,
                     device=query.device,
                 ).view(1, 1, T, T).detach()
-                is_causal = False
             else:
                 # We need a mask if T > 1, since inference needs to be causal
                 # for the new tokens
@@ -179,21 +180,24 @@ class MultiHeadSelfAttention:
                     sliding_window_size=self.config.sliding_window_size,
                 ).detach()
 
-        # Efficient attention using Flash Attention CUDA kernels.
-        # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
-        # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        return_scores = not (input_pos is None or for_prefill) and return_attn_weights
         y, scores = self.scaled_dot_product_attention(
             query,
             k_and_v,
             mask,
-            is_causal,
-            return_scores,
+            return_attn_weights,
+            input_pos,
             token_positions,
         )
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, -1)
         return y, scores
+
+    def _use_eager_sdpa(
+        self,
+        return_attn_weights: bool,
+        k_and_v: KeysAndValues,
+    ) -> bool:
+        return return_attn_weights or self.use_eager_sdpa_always or self.config.attention_logit_softcapping is not None or not k_and_v.both_in_parallel()
 
     def _filter_sdpa_kernels(
         self,
@@ -229,27 +233,24 @@ class MultiHeadSelfAttention:
         query: torch.Tensor,
         k_and_v: KeysAndValues,
         mask: Optional[torch.Tensor] = None,
-        is_causal: bool = True,
         return_scores: bool = False,
         input_pos: Optional[int] = None,
         token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        assert mask is None or not is_causal, "Cannot have mask and is_causal=True"
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
 
         # We cannot call PyTorch scaled_dot_product_attention if:
         # - Attention scores need to be returned; or
         # - Logit softcapping is required; or
-        # - We cannot access keys and values from `k_and_v` in parallel (this
-        #   never happens if `is_causal == True`)
-        if return_scores or self.use_eager_sdpa_always or self.config.attention_logit_softcapping is not None or not k_and_v.both_in_parallel():
+        # - We cannot access keys and values from `k_and_v` in parallel
+        if self._use_eager_sdpa(return_scores, k_and_v):
+            assert mask is not None
             y, scores = scaled_dot_product_attention(
                 query=query,
                 k_and_v=k_and_v,
                 scale=scale,
                 mask=mask,
                 attention_logit_softcapping=self.config.attention_logit_softcapping,
-                is_causal=is_causal,
             )
             if not return_scores:
                 scores = None
@@ -266,7 +267,7 @@ class MultiHeadSelfAttention:
                 attn_mask=mask,
                 dropout_p=0.0,
                 scale=scale,
-                is_causal=is_causal,
+                is_causal=mask is None,
                 enable_gqa=self.config.n_query_groups < self.config.n_head,
             )
             self._filter_sdpa_kernels(**kwargs)
@@ -292,20 +293,11 @@ def scaled_dot_product_attention(
     scale: float,
     mask: Optional[torch.Tensor] = None,
     attention_logit_softcapping: Optional[float] = None,
-    is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     dtype = query.dtype
     key = k_and_v.keys()
-    # Scale both `query` and `key` by `sqrt(scale)`, as is done in
-    # `torch.nn.functional.scaled_dot_product_attention`
     scores = attention_compute_scores(query, key) * scale
     scores = do_softcapping(scores, attention_logit_softcapping)
-    if mask is None and is_causal:
-        T = query.shape[2]
-        assert key.shape[2] == T, "is_causal=True only if query, key have same size"
-        mask = torch.ones(T, T, dtype=dtype, device=query.device).triu(diagonal=1)
-        mask.masked_fill_(mask.bool(), minus_infinity(dtype))
-        mask = mask.view(1, 1, T, T)
     if mask is not None:
         scores = scores + mask
     scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)

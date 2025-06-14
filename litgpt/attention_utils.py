@@ -65,23 +65,62 @@ def reorder_keys_values(
     assert cache_length >= num
     reorder_index = torch.empty_like(token_positions)
     dtype = token_positions.dtype
-    # Distinguish between token positions >= input_pos (1), and the rest
-    # (2). For (1), each token_position[b, h, :] is a permutation of
-    # input_pos:(input_pos + num). We use their argsort shifted to
-    # (cache_length - num):cache_length. The content of (2) does not
-    # matter, we map each token_position[b, h, :] to 0:(cache_length - num).
+    ind_kwargs = dict(dtype=dtype, device=token_positions.device)
+    # How this works:
+    # - tp: token_positions
+    # - ri: reorder_index
+    # - ip: input_pos
+    # - thresh = cache_length - num
+    #
+    # Q, K. K_til = K.gather(ri):
+    # K_til[b, h, j] = K[b, h, ri[b, h, j]], j = 0:cache_length
+    #
+    # K[b, h, j] <--> tp[b, h, j], j = 0:cache_length
+    # Q[b, h, i] <--> ip + i,      i = 0:num
+    #
+    # What we need of K_til:
+    # - For j >= thresh:
+    #   K_til[b, h, j] <--> ip + j - thresh
+    # - For j < thresh:
+    #   K_til[b, h, j] <--> positions < ip (permutation)
+    #
+    # [For j >= thresh]
+    # K_til[b, h, j] = K[b, h, ri[b, h, j]] <--> tp[b, h, ri[b, h, j]]
+    # ==> ip + j - thresh = tp[b, h, ri[b, h, j]], j = thresh:cache_length
+    #     ip + i = tp[b, h, ri[b, h, i + thresh]], i = 0:num
+    # - ri[b, h, i + thresh] needs to map to is_new positions in tp[b, h, :],
+    #   where is_new = tp >= ip. This is a boolean tensor, the corresponding
+    #   position index is new_pos, so that tp[b, h, new_pos[b, h, i]] >=
+    #   ip for i = 0:num.
+    #   ==> ri[b, h, i + thresh] = new_pos[b, h, i], i = 0:num.
+    # - They have the wrong ordering.
+    #   Extract tp_new = tp[is_new].view(...).expand(...):
+    #   tp[b, h, new_pos[b, h, i]] == tp_new[b, h, i]
+    #   Then: sort_ind = tp_new.argsort(dim=-1):
+    #   tp_new[b, h, sort_ind[b, h, i]] == ip + i
+    #   Now:
+    #   ip + i = tp_new[b, h, sort_ind[b, h, i]] = tp[b, h, new_pos[b, h, sort_ind[b, h, i]]]
+    #   ==> ri[b, h, i + thresh] = new_pos[b, h, sort_ind[b, h, i]]
+    # [For j < thresh]
+    # - If old_pos is the position index for ~is_new, we can just set:
+    #   ri[b, h, i] = old_pos[r, h, i], i = 0:thresh.
+    #   The order does not matter here
     is_new = token_positions >= input_pos
-    thresh = cache_length - num
-    temp_pos = token_positions[is_new]
+    tp_new = token_positions[is_new]
     should_be = batch_size * n_query_groups * num
-    assert temp_pos.numel() == should_be, f"{temp_pos.numel()} token_positions entries >= {input_pos}, should be {should_be}"
-    sort_ind = temp_pos.view(
-        batch_size, n_query_groups, -1,
-    ).argsort(dim=-1) + thresh
-    reorder_index[is_new] = sort_ind.flatten().to(dtype=dtype)
-    reorder_index[~is_new] = torch.arange(
-        thresh, dtype=dtype, device=token_positions.device,
-    ).unsqueeze(0).expand(batch_size * n_query_groups, -1).flatten()
+    assert tp_new.numel() == should_be, f"{tp_new.numel()} token_positions entries >= {input_pos}, should be {should_be}"
+    new_pos = torch.arange(cache_length, **ind_kwargs).view(
+        1, 1, -1,
+    ).expand_as(token_positions)[is_new].view(batch_size, n_query_groups, -1)
+    assert new_pos.shape[-1] == num  # Sanity check
+    sort_ind = tp_new.view(batch_size, n_query_groups, -1).argsort(dim=-1)
+    thresh = cache_length - num
+    reorder_index[:, :, thresh:] = new_pos.gather(dim=-1, index=sort_ind)
+    old_pos = torch.arange(cache_length, **ind_kwargs).view(
+        1, 1, -1,
+    ).expand_as(token_positions)[~is_new].view(batch_size, n_query_groups, -1)
+    assert old_pos.shape[-1] == thresh  # Sanity check
+    reorder_index[:, :, :thresh] = old_pos
     return reorder_index
 
 
@@ -231,22 +270,25 @@ def build_mask_slice(
     assert token_positions.ndim == 3
     tp_dtype = token_positions.dtype
     batch_size, n_query_groups, _ = token_positions.shape
-    token_positions = token_positions.unsqueeze(2).to(device=device)
+    assert n_head % n_query_groups == 0 and n_head >= n_query_groups
+    token_positions = token_positions.to(device=device).unsqueeze(2).expand(
+        -1, -1, num, -1,
+    )
     kwargs = dict(device=device, dtype=tp_dtype)
     bool_mask = torch.arange(
         input_pos, input_pos + num, **kwargs,
-    ).view(1, 1, -1, 1) < token_positions
+    ).view(1, 1, -1, 1).expand_as(token_positions) < token_positions
     if sliding_window_size is not None:
         extra_mask = torch.arange(
             input_pos - sliding_window_size,
             input_pos + num - sliding_window_size,
             **kwargs,
-        ).view(1, 1, -1, 1) >= token_positions
-        bool_mask += extra_mask
+        ).view(1, 1, -1, 1).expand_as(token_positions) >= token_positions
+        bool_mask |= extra_mask
     mask = torch.zeros(bool_mask.shape, dtype=dtype, device=device)
     mask.masked_fill_(bool_mask, minus_infinity(dtype))
-    q_per_kv = n_head // n_query_groups
-    if q_per_kv > 1:
+    if n_head != n_query_groups:
+        q_per_kv = n_head // n_query_groups
         mask = mask.unsqueeze(2).expand(
             -1, -1, q_per_kv, -1, -1,
         ).reshape(batch_size, n_head, num, -1)

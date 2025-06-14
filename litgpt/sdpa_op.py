@@ -83,7 +83,7 @@ class SDPAFunction(Function):
         ):
             reorder_index = reorder_keys_values(
                 input_pos, q_len, token_positions,
-            ).unsqueeze(-1).expand(-1, -1, -1, head_size)
+            ).unsqueeze(-1).expand_as(key)
             key = key.gather(dim=2, index=reorder_index)
             value = value.gather(dim=2, index=reorder_index)
         else:
@@ -139,11 +139,11 @@ class SDPAFunction(Function):
             # If the mask is (i, j), i over Q, j over K:
             # - If same unit: q_i depends on k_j for i >= j.
             #   So mask out i < j
-            # - Q, K are aligned at end: If offset = kv_len - q_len, then mask
-            #   out i + offset < j
-            offset = kv_len - q_len
+            # - Q, K are aligned at end: If thresh = kv_len - q_len, then mask
+            #   out i + thresh < j
+            thresh = kv_len - q_len
             kwargs = dict(device=device, dtype=torch.int)
-            mask_index = torch.arange(offset, kv_len, **kwargs).unsqueeze(-1) < torch.arange(kv_len, **kwargs).unsqueeze(0)
+            mask_index = torch.arange(thresh, kv_len, **kwargs).unsqueeze(-1) < torch.arange(kv_len, **kwargs).unsqueeze(0)
             tmp_array1[
                 mask_index[None, None, :, :].expand_as(tmp_array1)
             ] = minus_infinity(dtype=tmp_array1.dtype)  # S
