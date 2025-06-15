@@ -6,19 +6,21 @@ from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from litgpt.attention_utils import (
-    needs_reordering_keys_values,
-    reorder_keys_values,
     filter_sdpa_kernels,
     attention_compute_scores,
     minus_infinity,
+    build_mask_cache,
+    build_mask_slice,
+    mask_cache_bool,
+    mask_slice_bool,
 )
 
 
 class SDPAFunction(Function):
     """
-    Provides `scaled_dot_product_attention` in the basic `is_causal=True`
-    variant as an `autograd` operator, ensuring that only its inputs are
-    stored in the `autograd` graph, not the intermediates.
+    Provides `scaled_dot_product_attention` as an `autograd` operator,
+    ensuring that only its inputs are stored in the `autograd` graph, not the
+    intermediates.
 
     """
     @staticmethod
@@ -29,6 +31,7 @@ class SDPAFunction(Function):
         token_positions: Optional[torch.Tensor],
         input_pos: int,
         scale_factor: float,
+        sliding_window_size: Optional[int] = None,
         sdpa_kernels: Optional[Union[SDPBackend, List[SDPBackend]]] = None,
     ) -> torch.Tensor:
         # Check dimensions
@@ -39,21 +42,45 @@ class SDPAFunction(Function):
         _, n_head, q_len, _ = query.shape
         assert q_len <= kv_len
         assert n_query_groups <= n_head and n_head % n_query_groups == 0
-        if token_positions is not None:
+        is_causal = input_pos == 0
+        if is_causal:
+            assert q_len == kv_len
+            assert token_positions is None
+        else:
+            assert token_positions is not None
             assert token_positions.shape == key.shape[:-1]
-        # Prepare inputs (reordering, casting)
-        query, key, value, _ = SDPAFunction._prepare_inputs(
-            query, key, value, token_positions, input_pos,
-        )
+        # Computations are done in `float32`
+        query = query.to(dtype=torch.float32)
+        key = key.to(dtype=torch.float32)
+        value = value.to(dtype=torch.float32)
+        mask_kwargs = dict(dtype=torch.float32, device=query.device)
+        if is_causal:
+            if sliding_window_size is not None:
+                attn_mask = build_mask_cache(
+                    max_seq_length=kv_len,
+                    sliding_window_size=sliding_window_size,
+                    **mask_kwargs,
+                ).view(1, 1, kv_len, kv_len)
+            else:
+                attn_mask = None
+        else:
+            attn_mask = build_mask_slice(
+                input_pos=input_pos,
+                num=q_len,
+                token_positions=token_positions,
+                n_head=n_head,
+                **mask_kwargs,
+                sliding_window_size=sliding_window_size,
+            )
         # Run the right version of `F.scaled_dot_product_attention`
         kwargs = dict(
             query=query,
             key=key,
             value=value,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=0.0,
             scale=scale_factor,
-            is_causal=True,
+            is_causal=attn_mask is None,
             enable_gqa=n_query_groups < n_head,
         )
         if sdpa_kernels is not None:
@@ -69,38 +96,13 @@ class SDPAFunction(Function):
         return y.to(dtype=key.dtype)
 
     @staticmethod
-    def _prepare_inputs(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        token_positions: Optional[torch.Tensor],
-        input_pos: int,
-    ):
-        _, _, q_len, head_size = query.shape
-        # Reordering (if necessary)
-        if token_positions is not None and needs_reordering_keys_values(
-            input_pos, q_len, token_positions,
-        ):
-            reorder_index = reorder_keys_values(
-                input_pos, q_len, token_positions,
-            ).unsqueeze(-1).expand_as(key)
-            key = key.gather(dim=2, index=reorder_index)
-            value = value.gather(dim=2, index=reorder_index)
-        else:
-            reorder_index = None
-        # Computations are done in `float32`
-        query = query.to(dtype=torch.float32)
-        key = key.to(dtype=torch.float32)
-        value = value.to(dtype=torch.float32)
-        return query, key, value, reorder_index
-
-    @staticmethod
     def setup_context(ctx, inputs, output):
-        query, key, value, token_positions, input_pos, scale_factor, sdpa_kernels = inputs
+        query, key, value, token_positions, input_pos, scale_factor, sliding_window_size, sdpa_kernels = inputs
         ctx.save_for_backward(query, key, value, token_positions)
         ctx.extra_args = dict(
             input_pos=input_pos,
             scale_factor=scale_factor,
+            sliding_window_size=sliding_window_size,
         )
 
     @staticmethod
@@ -109,13 +111,15 @@ class SDPAFunction(Function):
         query, key, value, token_positions = ctx.saved_tensors
         input_pos = ctx.extra_args["input_pos"]
         scale_factor = ctx.extra_args["scale_factor"]
+        sliding_window_size = ctx.extra_args["sliding_window_size"]
+        is_causal = input_pos == 0
         grad_query = grad_key = grad_value = None
         # Prepare inputs
         device = query.device
         dtype = query.dtype
-        query, key, value, reorder_index = SDPAFunction._prepare_inputs(
-            query, key, value, token_positions, input_pos,
-        )
+        query = query.to(dtype=torch.float32)
+        key = key.to(dtype=torch.float32)
+        value = value.to(dtype=torch.float32)
         need_query = ctx.needs_input_grad[0]
         need_key = ctx.needs_input_grad[1]
         need_value = ctx.needs_input_grad[2]
@@ -135,18 +139,25 @@ class SDPAFunction(Function):
                 query=query, key=key,
             )
             tmp_array1 *= scale_factor  # S without masking
-            # Causal masking
-            # If the mask is (i, j), i over Q, j over K:
-            # - If same unit: q_i depends on k_j for i >= j.
-            #   So mask out i < j
-            # - Q, K are aligned at end: If thresh = kv_len - q_len, then mask
-            #   out i + thresh < j
-            thresh = kv_len - q_len
-            kwargs = dict(device=device, dtype=torch.int)
-            mask_index = torch.arange(thresh, kv_len, **kwargs).unsqueeze(-1) < torch.arange(kv_len, **kwargs).unsqueeze(0)
-            tmp_array1[
-                mask_index[None, None, :, :].expand_as(tmp_array1)
-            ] = minus_infinity(dtype=tmp_array1.dtype)  # S
+            # Attention masking
+            if is_causal:
+                bool_mask = mask_cache_bool(
+                    max_seq_length=kv_len,
+                    sliding_window_size=sliding_window_size,
+                    device=device,
+                    dtype=dtype,
+                ).bool()[None, None, :, :].expand_as(tmp_array1)
+            else:
+                bool_mask = mask_slice_bool(
+                    input_pos=input_pos,
+                    num=q_len,
+                    token_positions=token_positions,
+                    n_head=n_head,
+                    device=device,
+                    sliding_window_size=sliding_window_size,
+                )
+                assert bool_mask.shape == tmp_array1.shape
+            tmp_array1[bool_mask] = minus_infinity(dtype=tmp_array1.dtype)  # S
             # Softmax
             tmp_array2 = F.softmax(tmp_array1, dim=-1)  # f(S)
             if need_value:
@@ -157,10 +168,6 @@ class SDPAFunction(Function):
                         batch_size, n_query_groups, q_per_kv, head_size, kv_len,
                     ).sum(dim=2)
                 grad_value = grad_value.mT.to(dtype=dtype)
-                if reorder_index is not None:
-                    grad_value = torch.scatter(
-                        grad_value, dim=2, index=reorder_index, src=grad_value,
-                    )
             if need_query or need_key:
                 if q_per_kv == 1:
                     torch.matmul(grad_y, value.mT, out=tmp_array1)
@@ -202,9 +209,5 @@ class SDPAFunction(Function):
                         ).sum(dim=2)
                     grad_key *= scale_factor
                     grad_key = grad_key.mT.to(dtype=dtype)
-                    if reorder_index is not None:
-                        grad_key = torch.scatter(
-                            grad_key, dim=2, index=reorder_index, src=grad_key,
-                        )
 
         return grad_query, grad_key, grad_value, None, None, None, None

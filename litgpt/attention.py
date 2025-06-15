@@ -11,7 +11,6 @@ from litgpt.attention_utils import (
     build_mask_slice,
     attention_compute_scores,
     attention_compute_weighted_values,
-    minus_infinity,
 )
 from litgpt.config import Config
 
@@ -155,9 +154,8 @@ class MultiHeadSelfAttention:
         )
         B, _, T, _ = query.shape
         mask = None
-        if apply_sliding_window_attention or self._use_eager_sdpa(
-            return_attn_weights, k_and_v,
-        ) or not is_causal:
+        use_eager_sdpa = self._use_eager_sdpa(return_attn_weights, k_and_v)
+        if use_eager_sdpa or apply_sliding_window_attention or not is_causal:
             # Build attention mask
             if is_causal:
                 mask = build_mask_cache(
@@ -170,15 +168,18 @@ class MultiHeadSelfAttention:
                 # We need a mask if T > 1, since inference needs to be causal
                 # for the new tokens
                 assert input_pos > 0
-                mask = build_mask_slice(
-                    input_pos=input_pos,
-                    num=T,
-                    token_positions=token_positions,
-                    n_head=self.config.n_head,
-                    dtype=query.dtype,
-                    device=query.device,
-                    sliding_window_size=self.config.sliding_window_size,
-                ).detach()
+                if not use_eager_sdpa or T > 1:
+                    mask = build_mask_slice(
+                        input_pos=input_pos,
+                        num=T,
+                        token_positions=token_positions,
+                        n_head=self.config.n_head,
+                        dtype=query.dtype,
+                        device=query.device,
+                        sliding_window_size=self.config.sliding_window_size,
+                    ).detach()
+                else:
+                    mask = None
 
         y, scores = self.scaled_dot_product_attention(
             query,

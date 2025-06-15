@@ -9,121 +9,6 @@ from torch.backends.cuda import (
 from torch.nn.attention import SDPBackend, SDPAParams
 
 
-def needs_reordering_keys_values(
-    input_pos: int,
-    num: int,
-    token_positions: torch.Tensor,
-) -> bool:
-    """
-    See :func:`reorder_keys_values`. Here, we check some common conditions
-    under which the ordering already supports `is_causal=True`. If this is
-    the case, we return `False` (no reordering is needed).
-
-    Args:
-        input_pos: Position of first new token
-        num: Number of new tokens 'q_len`
-        token_positions: Token positions in KV cache
-
-    Returns:
-        Do keys and values buffers have to be reordered?
-
-    """
-    if num == 1:
-        return False
-    should_be = torch.arange(
-        input_pos,
-        input_pos + num,
-        device=token_positions.device,
-        dtype=token_positions.dtype,
-    ).view(1, 1, -1).expand(*token_positions.shape[:-1], -1)
-    return (token_positions[:, :, (-num):] != should_be).any().sum().item() > 0
-
-
-def reorder_keys_values(
-    input_pos: int,
-    num: int,
-    token_positions: torch.Tensor,
-) -> torch.Tensor:
-    """
-    In order to call `F.scaled_dot_product_attention` with `is_causal=True`,
-    the key and value buffers must be ordered such that the final `num`
-    entries correspond to the most recent tokens
-    `input_pos:(input_pos + num)`. Here, we create an index of the same
-    shape as `token_positions`, which performs such a reordering.
-
-    Args:
-        input_pos: Position of first new token
-        num: Number of new tokens 'q_len`
-        token_positions: Token positions in KV cache
-
-    Returns:
-        Index to reorder key and value buffers
-
-    """
-    assert token_positions.ndim == 3
-    batch_size, n_query_groups, cache_length = token_positions.shape
-    assert cache_length >= num
-    reorder_index = torch.empty_like(token_positions)
-    dtype = token_positions.dtype
-    ind_kwargs = dict(dtype=dtype, device=token_positions.device)
-    # How this works:
-    # - tp: token_positions
-    # - ri: reorder_index
-    # - ip: input_pos
-    # - thresh = cache_length - num
-    #
-    # Q, K. K_til = K.gather(ri):
-    # K_til[b, h, j] = K[b, h, ri[b, h, j]], j = 0:cache_length
-    #
-    # K[b, h, j] <--> tp[b, h, j], j = 0:cache_length
-    # Q[b, h, i] <--> ip + i,      i = 0:num
-    #
-    # What we need of K_til:
-    # - For j >= thresh:
-    #   K_til[b, h, j] <--> ip + j - thresh
-    # - For j < thresh:
-    #   K_til[b, h, j] <--> positions < ip (permutation)
-    #
-    # [For j >= thresh]
-    # K_til[b, h, j] = K[b, h, ri[b, h, j]] <--> tp[b, h, ri[b, h, j]]
-    # ==> ip + j - thresh = tp[b, h, ri[b, h, j]], j = thresh:cache_length
-    #     ip + i = tp[b, h, ri[b, h, i + thresh]], i = 0:num
-    # - ri[b, h, i + thresh] needs to map to is_new positions in tp[b, h, :],
-    #   where is_new = tp >= ip. This is a boolean tensor, the corresponding
-    #   position index is new_pos, so that tp[b, h, new_pos[b, h, i]] >=
-    #   ip for i = 0:num.
-    #   ==> ri[b, h, i + thresh] = new_pos[b, h, i], i = 0:num.
-    # - They have the wrong ordering.
-    #   Extract tp_new = tp[is_new].view(...).expand(...):
-    #   tp[b, h, new_pos[b, h, i]] == tp_new[b, h, i]
-    #   Then: sort_ind = tp_new.argsort(dim=-1):
-    #   tp_new[b, h, sort_ind[b, h, i]] == ip + i
-    #   Now:
-    #   ip + i = tp_new[b, h, sort_ind[b, h, i]] = tp[b, h, new_pos[b, h, sort_ind[b, h, i]]]
-    #   ==> ri[b, h, i + thresh] = new_pos[b, h, sort_ind[b, h, i]]
-    # [For j < thresh]
-    # - If old_pos is the position index for ~is_new, we can just set:
-    #   ri[b, h, i] = old_pos[r, h, i], i = 0:thresh.
-    #   The order does not matter here
-    is_new = token_positions >= input_pos
-    tp_new = token_positions[is_new]
-    should_be = batch_size * n_query_groups * num
-    assert tp_new.numel() == should_be, f"{tp_new.numel()} token_positions entries >= {input_pos}, should be {should_be}"
-    new_pos = torch.arange(cache_length, **ind_kwargs).view(
-        1, 1, -1,
-    ).expand_as(token_positions)[is_new].view(batch_size, n_query_groups, -1)
-    assert new_pos.shape[-1] == num  # Sanity check
-    sort_ind = tp_new.view(batch_size, n_query_groups, -1).argsort(dim=-1)
-    thresh = cache_length - num
-    reorder_index[:, :, thresh:] = new_pos.gather(dim=-1, index=sort_ind)
-    old_pos = torch.arange(cache_length, **ind_kwargs).view(
-        1, 1, -1,
-    ).expand_as(token_positions)[~is_new].view(batch_size, n_query_groups, -1)
-    assert old_pos.shape[-1] == thresh  # Sanity check
-    reorder_index[:, :, :thresh] = old_pos
-    return reorder_index
-
-
 def filter_sdpa_kernels(
     sdpa_kernels: List[SDPBackend],
     query: torch.Tensor,
@@ -210,6 +95,21 @@ def minus_infinity(dtype: torch.dtype) -> float:
     return torch.finfo(dtype).min
 
 
+def mask_cache_bool(
+    max_seq_length: int,
+    sliding_window_size: Optional[int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # Usual causal mask:
+    mask = torch.ones(
+        max_seq_length, max_seq_length, device=device, dtype=dtype,
+    ).triu(diagonal=1)
+    if sliding_window_size is not None:
+        mask += torch.ones_like(mask).tril(diagonal=-sliding_window_size)
+    return mask
+
+
 def build_mask_cache(
     max_seq_length: int,
     sliding_window_size: Optional[int],
@@ -226,14 +126,47 @@ def build_mask_cache(
     │ True True  True  True  │  │ False False True True │  │ False False True  True  │
     └────────────────────────┘  └───────────────────────┘  └─────────────────────────┘
     """
-    # Usual causal mask:
-    mask = torch.ones(
-        max_seq_length, max_seq_length, device=device, dtype=dtype,
-    ).triu(diagonal=1)
-    if sliding_window_size is not None:
-        mask += torch.ones_like(mask).tril(diagonal=-sliding_window_size)
+    mask = mask_cache_bool(max_seq_length, sliding_window_size, device, dtype)
     mask.masked_fill_(mask.bool(), minus_infinity(dtype))
     return mask
+
+
+def mask_slice_bool(
+    input_pos: int,
+    num: int,
+    token_positions: torch.Tensor,
+    n_head: int,
+    device: torch.device,
+    sliding_window_size: Optional[int] = None,
+) -> torch.Tensor:
+    # Build boolean mask, then map False -> 0, True -> -infty
+    # If (i, j) indexes the complete (seq_len, seq_len) mask matrix,
+    # causality is given by I(i < j). If `sliding_window_size` is given,
+    # this translates to I(i >= j + sws) if sws = sliding_window_size.
+    assert token_positions.ndim == 3
+    tp_dtype = token_positions.dtype
+    batch_size, n_query_groups, _ = token_positions.shape
+    assert n_head % n_query_groups == 0 and n_head >= n_query_groups
+    token_positions = token_positions.to(device=device).unsqueeze(2).expand(
+        -1, -1, num, -1,
+    )
+    kwargs = dict(device=device, dtype=tp_dtype)
+    bool_mask = torch.arange(
+        input_pos, input_pos + num, **kwargs,
+    ).view(1, 1, -1, 1).expand_as(token_positions) < token_positions
+    if sliding_window_size is not None:
+        extra_mask = torch.arange(
+            input_pos - sliding_window_size,
+            input_pos + num - sliding_window_size,
+            **kwargs,
+        ).view(1, 1, -1, 1).expand_as(token_positions) >= token_positions
+        bool_mask |= extra_mask
+    if n_head != n_query_groups:
+        q_per_kv = n_head // n_query_groups
+        bool_mask = bool_mask.unsqueeze(2).expand(
+            -1, -1, q_per_kv, -1, -1,
+        ).reshape(batch_size, n_head, num, -1)
+    return bool_mask
 
 
 def build_mask_slice(
@@ -263,33 +196,9 @@ def build_mask_slice(
         Mask tensor, shape `(eff_batch_size, n_head, num, cache_length)`
 
     """
-    # Build boolean mask, then map False -> 0, True -> -infty
-    # If (i, j) indexes the complete (seq_len, seq_len) mask matrix,
-    # causality is given by I(i < j). If `sliding_window_size` is given,
-    # this translates to I(i >= j + sws) if sws = sliding_window_size.
-    assert token_positions.ndim == 3
-    tp_dtype = token_positions.dtype
-    batch_size, n_query_groups, _ = token_positions.shape
-    assert n_head % n_query_groups == 0 and n_head >= n_query_groups
-    token_positions = token_positions.to(device=device).unsqueeze(2).expand(
-        -1, -1, num, -1,
+    bool_mask = mask_slice_bool(
+        input_pos, num, token_positions, n_head, device, sliding_window_size,
     )
-    kwargs = dict(device=device, dtype=tp_dtype)
-    bool_mask = torch.arange(
-        input_pos, input_pos + num, **kwargs,
-    ).view(1, 1, -1, 1).expand_as(token_positions) < token_positions
-    if sliding_window_size is not None:
-        extra_mask = torch.arange(
-            input_pos - sliding_window_size,
-            input_pos + num - sliding_window_size,
-            **kwargs,
-        ).view(1, 1, -1, 1).expand_as(token_positions) >= token_positions
-        bool_mask |= extra_mask
     mask = torch.zeros(bool_mask.shape, dtype=dtype, device=device)
     mask.masked_fill_(bool_mask, minus_infinity(dtype))
-    if n_head != n_query_groups:
-        q_per_kv = n_head // n_query_groups
-        mask = mask.unsqueeze(2).expand(
-            -1, -1, q_per_kv, -1, -1,
-        ).reshape(batch_size, n_head, num, -1)
     return mask
