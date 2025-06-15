@@ -398,7 +398,7 @@ def rope_cache_OLD(
     )
 
 
-# TODO: Refactor!
+# TODO: WHY DOES THIS FAIL??
 @pytest.mark.parametrize(
     "model_name", ["gemma-2-27b", "gemma-3-27b-it"],
 )
@@ -490,15 +490,16 @@ def copy_requires_grad(x: torch.Tensor) -> torch.Tensor:
     return x.clone().detach().requires_grad_(True)
 
 
+# TODO: Include sliding_window_size as well
 @pytest.mark.parametrize(
     ("n_head", "n_query_groups", "q_len", "kv_len", "dtype"),
     (
         (4, 2, 128, 512, torch.float32),
-#        (4, 4, 1, 256, torch.float32),
-#        (8, 4, 128, 128, torch.float32),
-#        (12, 4, 16, 512, torch.float32),
-#        (24, 8, 2, 512, torch.float16),
-#        (9, 3, 128, 512, torch.bfloat16),
+        (4, 4, 1, 256, torch.float32),
+        (8, 4, 128, 128, torch.float32),
+        (12, 4, 16, 512, torch.float32),
+        (24, 8, 2, 512, torch.float16),
+        (9, 3, 128, 512, torch.bfloat16),
     ),
 )
 def test_sdpa_op_gradients(n_head, n_query_groups, q_len, kv_len, dtype):
@@ -507,21 +508,17 @@ def test_sdpa_op_gradients(n_head, n_query_groups, q_len, kv_len, dtype):
     torch.random.manual_seed(seed)
     num_repeats = 32
     seq_len = 2 * kv_len
-    input_pos = seq_len - q_len
+    is_causal = q_len == kv_len
+    input_pos = seq_len - q_len if not is_causal else 0
 
-    print(f"n_head={n_head}, n_query_groups={n_query_groups}, q_len={q_len}, kv_len={kv_len}, dtype={dtype}")
+    print(f"n_head={n_head}, n_query_groups={n_query_groups}, q_len={q_len}, kv_len={kv_len}, is_causal={is_causal}, dtype={dtype}")
     for repeat in range(num_repeats):
         head_size = 2 ** random.randint(3, 6)
         batch_size = random.randint(1, 5)
-        is_causal = repeat % 2 == 0
-        print(f"repeat={repeat}, is_causal={is_causal}, head_size={head_size}, batch_size={batch_size}")
+        print(f"repeat={repeat}, head_size={head_size}, batch_size={batch_size}")
         index_kwargs = dict(dtype=torch.int64, device=torch.device("cpu"))
-        token_positions = None
         if is_causal:
-            if repeat % 4 != 0:
-                token_positions = torch.arange(
-                    seq_len - kv_len, seq_len, **index_kwargs,
-                ).view(1, 1, -1).expand(batch_size, n_query_groups, -1)
+            token_positions = None
         else:
             token_positions = torch.zeros(
                 (batch_size, n_query_groups, kv_len), **index_kwargs,

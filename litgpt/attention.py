@@ -164,22 +164,18 @@ class MultiHeadSelfAttention:
                     dtype=query.dtype,
                     device=query.device,
                 ).view(1, 1, T, T).detach()
-            else:
+            elif not use_eager_sdpa or T > 1:
                 # We need a mask if T > 1, since inference needs to be causal
                 # for the new tokens
-                assert input_pos > 0
-                if not use_eager_sdpa or T > 1:
-                    mask = build_mask_slice(
-                        input_pos=input_pos,
-                        num=T,
-                        token_positions=token_positions,
-                        n_head=self.config.n_head,
-                        dtype=query.dtype,
-                        device=query.device,
-                        sliding_window_size=self.config.sliding_window_size,
-                    ).detach()
-                else:
-                    mask = None
+                mask = build_mask_slice(
+                    input_pos=input_pos,
+                    num=T,
+                    token_positions=token_positions,
+                    n_head=self.config.n_head,
+                    dtype=query.dtype,
+                    device=query.device,
+                    sliding_window_size=self.config.sliding_window_size,
+                ).detach()
 
         y, scores = self.scaled_dot_product_attention(
             query,

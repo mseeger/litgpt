@@ -210,4 +210,4 @@ class SDPAFunction(Function):
                     grad_key *= scale_factor
                     grad_key = grad_key.mT.to(dtype=dtype)
 
-        return grad_query, grad_key, grad_value, None, None, None, None
+        return grad_query, grad_key, grad_value, None, None, None, None, None
