@@ -148,6 +148,10 @@ class KVCache(torch.nn.Module):
           `num <= max_prefill_length`. The effective batch size must be
           `eff_batch_size <= batch_size`. This batch size is then fixed for
           subsequent calls of :meth:`forward`.
+          Different to update (`input_pos > 0`), additional information (such
+          as attention weights) are not obtained here. This is because the
+          typical prefill size is much larger than `num` in update, and device
+          memory is much more of a concern.
         * Update (`input_pos > 0`): Continues a generation loop (or processing
           of large prompt). The length must be `num <= max_tokens_forward`.
 
@@ -364,7 +368,7 @@ class DefaultKVCache(KVCache):
             k_and_v = self._forward(key, value, token_idx)
 
         # Multi-head self-attention main computation
-        return_attn_weights = self.update_requires_attn_weights()
+        return_attn_weights = (not for_prefill) and self.update_requires_attn_weights()
         y, scores = self.mha(
             query=query,
             k_and_v=k_and_v,

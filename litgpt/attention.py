@@ -299,6 +299,6 @@ def scaled_dot_product_attention(
     scores = do_softcapping(scores, attention_logit_softcapping)
     if mask is not None:
         scores = scores + mask
-    scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=dtype)
+    scores = F.softmax(scores, dim=-1, dtype=torch.float32).to(dtype=dtype)
     value = k_and_v.values()
     return attention_compute_weighted_values(scores, value), scores
