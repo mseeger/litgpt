@@ -479,7 +479,7 @@ class Config(BaseConfig):
 
 class GPT(BaseModel):
     # Copy & paste from :class:`model.GPT`. Note that :class:`Block` is new here.
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, **mha_kwargs) -> None:
         nn.Module.__init__(self)
         assert config.padded_vocab_size is not None
         self.config = config
@@ -498,7 +498,7 @@ class GPT(BaseModel):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        self.mha = MultiHeadSelfAttention(config)
+        self.mha = MultiHeadSelfAttention(config, **mha_kwargs)
         self.max_seq_length = self.config.block_size
         self._start_of_layer_hook = config.start_of_layer_hook
         # Have dense KV caches been created by `set_kv_cache`?
