@@ -87,6 +87,13 @@ class DefaultKeysAndValues(KeysAndValues):
         """
         return True
 
+    def clear(self):
+        if self._keys is not None:
+            del self._keys
+            self._keys = None
+            del self._values
+            self._values = None
+
 
 class MultiHeadSelfAttention:
     """
