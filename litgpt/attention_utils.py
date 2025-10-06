@@ -239,7 +239,6 @@ def build_mask_slice(
         n_head: Number of attention heads, must be multiple of
             `n_query_groups`
         dtype: Data type of the output mask
-        device: Device of the output mask
         sliding_window_size: Size of sliding window (if any)
 
     Returns:
@@ -265,9 +264,8 @@ def build_mask_slice(
 # Maximum umber of `float32` entries for `tmp_array` for GB
 ENTRIES_PER_GB = 2 ** 28
 
-# Maximum number of `float32` entries for `tmp_array`. Corresponds to a
-# 3 GB limit.
-BACKWARD_TMP_ARRAYS_MAX_NUM_ENTRIES = 3 * ENTRIES_PER_GB
+# Maximum size of `tmp_array` in GB
+DEFAULT_TMP_ARRAY_LIMIT_GB = 3
 
 
 def max_num_entries_from_max_gb(max_gb: float) -> int:
@@ -281,12 +279,12 @@ def create_temp_array(
     q_len: int,
     kv_len: int,
     device: torch.device,
-    num_temp_entry_limit: Optional[int] = None,
+    tmp_array_limit_gb: Optional[float] = None,
 ) -> Tuple[torch.Tensor, int, int]:
     """
     Creates a temporary array of shape `(batch_size, n_head, tmp_len, kv_len)`.
     Here, `tmp_len` is such that the number of entries is
-    `<= num_temp_entry_limit`, and
+    `<= max_num_entries_from_max_gb(temp_entry_limit_gb)`, and
     `tmp_len * num_splits >= q_len`.
 
     Args:
@@ -295,23 +293,24 @@ def create_temp_array(
         q_len: Length of query sequence
         kv_len: Length of key, value sequence
         device: Device for arrays
-        num_temp_entry_limit: See above, defaults to
-            :const:`BACKWARD_TMP_ARRAYS_MAX_NUM_ENTRIES`
+        tmp_array_limit_gb: See above, defaults to
+            :const:`DEFAULT_TMP_ARRAY_LIMIT_GB`
 
     Returns:
         `tmp_array, num_splits, tmp_len`
 
     """
-    if num_temp_entry_limit is None:
-        num_temp_entry_limit = BACKWARD_TMP_ARRAYS_MAX_NUM_ENTRIES
+    if tmp_array_limit_gb is None:
+        tmp_array_limit_gb = DEFAULT_TMP_ARRAY_LIMIT_GB
+    tmp_array_max_num_entries = max_num_entries_from_max_gb(tmp_array_limit_gb)
     factor = batch_size * n_head * kv_len
-    if factor * q_len <= num_temp_entry_limit:
+    if factor * q_len <= tmp_array_max_num_entries:
         tmp_len = q_len
         num_splits = 1
     else:
-        tmp_len = num_temp_entry_limit // factor
+        tmp_len = tmp_array_max_num_entries // factor
         if tmp_len < 1:
-            raise ValueError(f"batch_size={batch_size}, n_head={n_head}, kv_len={kv_len} too large. Their product must be <= {num_temp_entry_limit}")
+            raise ValueError(f"batch_size={batch_size}, n_head={n_head}, kv_len={kv_len} too large. Their product must be <= {tmp_array_max_num_entries}")
         num_splits = int(math.ceil(q_len / tmp_len))
     shape = (batch_size, n_head, tmp_len, kv_len)
     kwargs = dict(device=device, dtype=torch.float32)

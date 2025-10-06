@@ -128,13 +128,13 @@ class MultiHeadSelfAttention:
         config: Config,
         sdpa_kernels: Optional[Union[SDPBackend, List[SDPBackend]]] = None,
         use_eager_sdpa_always: bool = False,
-        num_temp_entry_limit: Optional[int] = None,
+        tmp_array_limit_gb: Optional[float] = None,
     ) -> None:
         self.config = config
         self._sdpa_kernels = sdpa_kernels
         self._sdpa_kernels_filtered = False
         self.use_eager_sdpa_always = use_eager_sdpa_always
-        self._num_temp_entry_limit = num_temp_entry_limit
+        self._tmp_array_limit_gb = tmp_array_limit_gb
         if self.config.attention_logit_softcapping is not None:
             print(
                 "Your model uses attention logit softcapping "
@@ -149,8 +149,8 @@ class MultiHeadSelfAttention:
         return self._sdpa_kernels if self._sdpa_kernels is not None else []
 
     @property
-    def num_temp_entry_limit(self) -> Optional[int]:
-        return self._num_temp_entry_limit
+    def tmp_array_limit_gb(self) -> Optional[float]:
+        return self._tmp_array_limit_gb
 
     def set_seq_length(
         self,
@@ -338,7 +338,7 @@ class MultiHeadSelfAttention:
                 sliding_window_size=sliding_window_size,
                 mask=mask,
                 attention_logit_softcapping=self.config.attention_logit_softcapping,
-                num_temp_entry_limit=self._num_temp_entry_limit,
+                tmp_array_limit_gb=self._tmp_array_limit_gb,
             )
             if not return_attn_weights:
                 scores = None
@@ -396,7 +396,7 @@ def scaled_dot_product_attention(
     sliding_window_size: Optional[int],
     mask: Optional[torch.Tensor] = None,
     attention_logit_softcapping: Optional[float] = None,
-    num_temp_entry_limit: Optional[int] = None,
+    tmp_array_limit_gb: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if not use_blocking:
         dtype = query.dtype
@@ -430,7 +430,7 @@ def scaled_dot_product_attention(
             input_pos=input_pos,
             token_positions=token_positions,
             sliding_window_size=sliding_window_size,
-            num_temp_entry_limit=num_temp_entry_limit,
+            tmp_array_limit_gb=tmp_array_limit_gb,
         )
 
 
@@ -442,7 +442,7 @@ def scaled_dot_product_attention_in_blocks(
     input_pos: int,
     token_positions: Optional[torch.Tensor],
     sliding_window_size: Optional[int],
-    num_temp_entry_limit: Optional[int] = None,
+    tmp_array_limit_gb: Optional[float] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     device = query.device
     dtype = query.dtype
@@ -457,7 +457,7 @@ def scaled_dot_product_attention_in_blocks(
         q_len=q_len,
         kv_len=kv_len,
         device=device,
-        num_temp_entry_limit=num_temp_entry_limit,
+        tmp_array_limit_gb=tmp_array_limit_gb,
     )
     # Iterate over slices along `q_len` dimension
     output_parts = []

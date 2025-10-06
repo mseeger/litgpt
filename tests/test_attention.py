@@ -16,6 +16,7 @@ from litgpt.attention_utils import (
     build_mask_cache,
     build_mask_slice,
     sample_token_positions,
+    ENTRIES_PER_GB,
 )
 from litgpt.config import Config
 from litgpt.kvcache import KVCache
@@ -663,12 +664,12 @@ def test_attention_in_blocks(n_head, n_query_groups, q_len, kv_len, dtype, slidi
             "yes": MultiHeadSelfAttention(
                 config,
                 use_eager_sdpa_always=True,
-                num_temp_entry_limit=numel_tmp // 3,
+                tmp_array_limit_gb=numel_tmp / 3 / ENTRIES_PER_GB,
             ),
             "no": MultiHeadSelfAttention(
                 config,
                 use_eager_sdpa_always=True,
-                num_temp_entry_limit=2 * numel_tmp,
+                tmp_array_limit_gb=2 * numel_tmp / ENTRIES_PER_GB,
             ),
         }
         for kind in ("no", "yes"):
