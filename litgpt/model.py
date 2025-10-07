@@ -8,7 +8,6 @@ https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
 
 from functools import partial
 from typing import Any, List, Optional, Tuple, Union
-import math
 
 from typing_extensions import Self
 
@@ -28,7 +27,6 @@ from litgpt.kvcache import (
     KVCacheParams,
 )
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
-from litgpt.utils import batched_index_select
 
 
 class GPT(nn.Module):
@@ -1001,3 +999,22 @@ class RMSNorm(torch.nn.Module):
 
     def reset_parameters(self) -> None:
         torch.nn.init.ones_(self.weight)
+
+
+def batched_index_select(t: torch.Tensor, dim: int, idx: torch.Tensor) -> torch.Tensor:
+    """index_select for batched index and unbatched t"""
+    if idx.ndim == 1:
+        return torch.index_select(t, dim, idx)
+
+    *batch_shape, idx_size = idx.shape
+    res = torch.index_select(t, dim, idx.reshape(-1))  # flat index
+    # split out single batch idx
+    res = res.view(*t.shape[:dim], -1, idx_size, *t.shape[dim + 1 :])
+    if dim > 0:
+        # move batch dim to front, this is np.rollaxis(res, dim, 0) for tensors
+        dims = [dim] + list(range(res.ndim))
+        del dims[dim + 1]
+        res = res.permute(dims)
+    # unflatten batch dims
+    res = res.view(*batch_shape, *res.shape[1:])
+    return res

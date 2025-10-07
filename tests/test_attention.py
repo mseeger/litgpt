@@ -24,9 +24,8 @@ from litgpt.model import (
     GPT,
     CausalSelfAttention,
     apply_rope,
-    build_rope_cache,
+    build_rope_cache, batched_index_select,
 )
-from litgpt.utils import batched_index_select
 
 
 @pytest.mark.parametrize(
